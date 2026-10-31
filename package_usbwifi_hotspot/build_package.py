@@ -8,6 +8,9 @@ Target Hardware:
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -21,6 +24,7 @@ DEX_DIR = BUILD_DIR / "dex"
 PKG_SRC_DIR = BASE_DIR / "src" / "usbwifi-hotspot"
 USB_ROOT_DIR = BASE_DIR / "usb_root"
 MODULES_IN_DIR = BASE_DIR / "modules"
+OTA_OUT_DIR = BASE_DIR.parent / "ota"
 OUTER_ZIP_PATH = BASE_DIR.parent / "HKG_5W_USBWifi_Hotspot.zip"
 
 
@@ -180,6 +184,9 @@ def build() -> None:
         "# Hotspot mode: 1 = enable DNS & NAT forwarding to rmnet0/rmnet1 LTE if available,\n"
         "# 0 = pure local AP (no default gateway pushed)\n"
         "ENABLE_LTE_NAT=1\n"
+        "\n"
+        "# GitHub OTA Auto-Update: 1 = automatically check & install updates from GRT47/HKG_5W_USB_Wlan, 0 = manual only\n"
+        "AUTO_UPDATE=1\n"
     )
 
     # 3. Post-install script (scripts/post.sh)
@@ -869,6 +876,12 @@ def build() -> None:
         "            _alt_tbl=\"60\"\n"
         "        fi\n"
         "        # Priority 9900 & 9910 run BEFORE Android netd rule 10000 (from all fwmark 0x0/0xffff lookup 60)\n"
+        "        ip rule del pref 9850 2>/dev/null\n"
+        "        ip rule del pref 9851 2>/dev/null\n"
+        "        ip rule del pref 9852 2>/dev/null\n"
+        "        ip rule add pref 9850 to 8.8.8.8/32 lookup \"$_up_tbl\" 2>/dev/null\n"
+        "        ip rule add pref 9851 to 1.1.1.1/32 lookup \"$_up_tbl\" 2>/dev/null\n"
+        "        ip rule add pref 9852 to 185.199.108.0/22 lookup \"$_up_tbl\" 2>/dev/null\n"
         "        ip rule add pref 9900 to \"${_ip%.*}.0/$AP_PREFIX\" lookup main 2>/dev/null\n"
         "        ip rule add pref 9910 from \"${_ip%.*}.0/$AP_PREFIX\" lookup \"$_up_tbl\" 2>/dev/null\n"
         "        ip rule add pref 17900 from \"${_ip%.*}.0/$AP_PREFIX\" to \"${_ip%.*}.0/$AP_PREFIX\" lookup main 2>/dev/null\n"
@@ -1107,6 +1120,11 @@ def build() -> None:
         "LAST_USB_SYNC=0\n"
         "SNAP_TICK=0\n"
         "while true; do\n"
+        "    if [ -f \"$TMP_DIR/ota_reload_daemon\" ]; then\n"
+        "        rm -f \"$TMP_DIR/ota_reload_daemon\" \"$TMP_DIR/daemon.pid\" 2>/dev/null\n"
+        "        log_info \"OTA update applied -> re-executing usbwifi-hotspot-daemon.sh\"\n"
+        "        exec /system/bin/sh \"$APP_DIR/svc/usbwifi-hotspot-daemon.sh\"\n"
+        "    fi\n"
         "    if [ -f \"$TMP_DIR/force_restart\" ]; then\n"
         "        rm -f \"$TMP_DIR/force_restart\" 2>/dev/null\n"
         "        log_info \"Mode switch / restart requested via UI dashboard\"\n"
@@ -1191,6 +1209,7 @@ def build() -> None:
         "        LAST_USB_SYNC=0\n"
         "    fi\n"
         "    for _tick in 1 2 3 4 5; do\n"
+        "        [ -f \"$TMP_DIR/ota_reload_daemon\" ] && break\n"
         "        [ -f \"$TMP_DIR/force_restart\" ] && break\n"
         "        [ -f \"$TMP_DIR/trigger_scan\" ] && break\n"
         "        [ -f \"$TMP_DIR/disconnect_sta\" ] && break\n"
@@ -1211,6 +1230,40 @@ def build() -> None:
     stage_jar = PKG_SRC_DIR / "bin" / "usbwifistatus.jar"
     stage_jar.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(jar_path, stage_jar)
+
+    # Generate pure-text GitHub OTA manifest & assets in ota/
+    jar_bytes = stage_jar.read_bytes()
+    daemon_bytes = (PKG_SRC_DIR / "svc" / "usbwifi-hotspot-daemon.sh").read_bytes()
+    launch_bytes = (PKG_SRC_DIR / "bin" / "launch.sh").read_bytes()
+
+    sha256_jar = hashlib.sha256(jar_bytes).hexdigest()
+    sha256_daemon = hashlib.sha256(daemon_bytes).hexdigest()
+    sha256_launch = hashlib.sha256(launch_bytes).hexdigest()
+
+    version_manifest = json.dumps(
+        {
+            "version": "1.8.0",
+            "repo": "GRT47/HKG_5W_USB_Wlan",
+            "branch": "main",
+            "sha256_jar": sha256_jar,
+            "sha256_daemon": sha256_daemon,
+            "sha256_launch": sha256_launch,
+            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode with GitHub OTA Auto-Update",
+        },
+        indent=2,
+        ensure_ascii=False,
+    ) + "\n"
+
+    write_lf(PKG_SRC_DIR / "config" / "version.json", version_manifest)
+
+    OTA_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    write_lf(OTA_OUT_DIR / "version.json", version_manifest)
+    write_lf(OTA_OUT_DIR / "usbwifi-hotspot-daemon.sh", daemon_sh)
+    write_lf(OTA_OUT_DIR / "launch.sh", launch_sh)
+
+    b64_raw = base64.b64encode(jar_bytes).decode("ascii")
+    b64_lines = "\n".join(b64_raw[i : i + 76] for i in range(0, len(b64_raw), 76)) + "\n"
+    write_lf(OTA_OUT_DIR / "usbwifistatus.b64", b64_lines)
 
     # Copy compiled .ko modules from package_usbwifi_hotspot/modules/
     pkg_mod_dir = PKG_SRC_DIR / "modules"

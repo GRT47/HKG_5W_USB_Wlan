@@ -12,11 +12,18 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
+import java.net.Socket;
 import java.nio.charset.Charset;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -24,6 +31,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 
 /**
  * HKG Standard Gen5W (Android 4.4.2 API 19) — USB Wi-Fi Hotspot Real-Time Status Dashboard Overlay.
@@ -38,11 +49,13 @@ import java.util.Map;
  *  - Built-in Wi-Fi (bcmdhd / wlan0) coexistence status
  *  - SoftAP (hostapd) & DHCP (dnsmasq) state, SSID, password, band/channel, connected clients
  *  - Live tail of daemon.log & hostapd.log
- *  - Interactive touch buttons: [Restart AP], [Band 2.4G <-> 5G], [Subnet .0.1 <-> .43.1], [Export Logs]
+ *  - Interactive touch buttons: [GitHub OTA Update], [Restart AP], [Band 2.4G <-> 5G], [Subnet .0.1 <-> .43.1], [Export Logs]
  */
 public class UsbWifiStatusMain {
 
-    public static final String UI_VERSION = "1.7.0";
+    public static final String UI_VERSION = "1.8.0";
+    public static final String GITHUB_RAW_HOST = "raw.githubusercontent.com";
+    public static final String GITHUB_OTA_BASE_PATH = "/GRT47/HKG_5W_USB_Wlan/main/ota";
     private static final Charset UTF8 = Charset.forName("UTF-8");
 
     private static final String TMP_DIR_PATH = "/data/local/tmp/usbwifi_hotspot";
@@ -98,6 +111,7 @@ public class UsbWifiStatusMain {
         public String apChannel = "6";
         public String forceSubnet = "AUTO";
         public String enableLteNat = "1";
+        public String autoUpdate = "1";
 
         public String staSsid = "";
         public String staPass = "";
@@ -143,6 +157,7 @@ public class UsbWifiStatusMain {
         snap.staPass = stripQuotes( getOrDefault(conf, "STA_PASS", "") );
         snap.forceSubnet = stripQuotes( getOrDefault(conf, "FORCE_SUBNET", "AUTO") );
         snap.enableLteNat = stripQuotes( getOrDefault(conf, "ENABLE_LTE_NAT", "1") );
+        snap.autoUpdate = stripQuotes( getOrDefault(conf, "AUTO_UPDATE", "1") );
 
         // Override with live hostapd.conf if present
         File liveHostapdConf = new File(WIFI_WORK_DIR_PATH, "hostapd.conf");
@@ -769,11 +784,20 @@ public class UsbWifiStatusMain {
         private static volatile Object staSavedListTv = null;
         private static volatile Object staTrafficTv = null;
 
-        // Expert Mode Views
+        // Expert Mode & OTA Update Views
+        private static volatile Object otaUpdateBtn = null;
+        private static volatile Object autoUpdateToggleBtn = null;
         private static volatile Object headerSysInfoTextView = null;
         private static volatile Object leftColTextView = null;
         private static volatile Object rightColTextView = null;
         private static volatile Object subnetCycleBtn = null;
+
+        // OTA State
+        private static volatile boolean otaCheckingOrUpdating = false;
+        private static volatile boolean otaUpdateAvailable = false;
+        private static volatile String otaRemoteVersion = UI_VERSION;
+        private static volatile String otaStatusSummary = "자동 확인 대기 중";
+        private static volatile long lastManualOtaTapMs = 0L;
 
         // Footer Views
         private static volatile Object footerStatusTextView = null;
@@ -836,6 +860,34 @@ public class UsbWifiStatusMain {
             }, "UsbWifiSnapshotWorker");
             samplerThread.setDaemon(true);
             samplerThread.start();
+
+            Thread otaWorker = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        // Wait 45s after boot/daemon start so LTE (rmnet1) or STA Wi-Fi (rtwlan0) is ready
+                        Thread.sleep(45000L);
+                    } catch (Throwable ignored) {
+                    }
+                    while (true) {
+                        try {
+                            if (!isEditModalOpen && !otaCheckingOrUpdating) {
+                                Map<String, String> conf = parseKeyValueFile(new File(installDir, "config/hotspot.conf"));
+                                boolean autoOn = !"0".equals(stripQuotes(getOrDefault(conf, "AUTO_UPDATE", "1")));
+                                checkAndApplyGitHubOta(installDir, autoOn, false, true);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        try {
+                            // Re-check GitHub every 3 hours in background
+                            Thread.sleep(3L * 3600L * 1000L);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            }, "UsbWifiOtaAutoWorker");
+            otaWorker.setDaemon(true);
+            otaWorker.start();
 
             Thread uiThread = new Thread(new Runnable() {
                 @Override
@@ -1056,7 +1108,22 @@ public class UsbWifiStatusMain {
             Object hdrSpacer = viewCls.getConstructor(ctxCls).newInstance(sysContext);
             addView.invoke(headerRow, hdrSpacer, llLpCtor3.newInstance(0, 1, 1.0f));
 
-            // Header Action Buttons: [🔄 재시작] [💾 로그 저장] [🔧 상세 정보] [✖ 닫기]
+            // Header Action Buttons: [☁️ 업데이트] [🔄 재시작] [💾 로그 저장] [🔧 상세 정보] [✖ 닫기]
+            otaUpdateBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(otaUpdateBtn, "☁️ 업데이트", 13.5f, 0xFFFFFFFF, true);
+            tvSetGravity.invoke(otaUpdateBtn, 17);
+            setPad.invoke(otaUpdateBtn, 16, 9, 16, 9);
+            setRoundedBg(otaUpdateBtn, 0xFF4F46E5, 0xFF818CF8, 1, 11f);
+            attachClickListener(otaUpdateBtn, new Runnable() {
+                @Override
+                public void run() {
+                    triggerGitHubOtaFromUi();
+                }
+            });
+            Object otaBtnLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(otaBtnLp, 0, 0, 8, 0);
+            addView.invoke(headerRow, otaUpdateBtn, otaBtnLp);
+
             Object restartBtn = tvCtor.newInstance(sysContext);
             setTextViewStyle(restartBtn, "🔄 재시작", 13.5f, 0xFFFFFFFF, true);
             tvSetGravity.invoke(restartBtn, 17);
@@ -1574,6 +1641,20 @@ public class UsbWifiStatusMain {
             headerSysInfoTextView = tvCtor.newInstance(sysContext);
             setTextViewStyle(headerSysInfoTextView, "CPU --% | RAM --", 12.5f, 0xFF94A3B8, true);
             addView.invoke(expLeftBot, headerSysInfoTextView, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+
+            autoUpdateToggleBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(autoUpdateToggleBtn, "☁️ 자동업데이트: 켜짐", 12.5f, 0xFFC7D2FE, true);
+            setPad.invoke(autoUpdateToggleBtn, 12, 6, 12, 6);
+            setRoundedBg(autoUpdateToggleBtn, 0xFF312E81, 0xFF6366F1, 1, 8f);
+            attachClickListener(autoUpdateToggleBtn, new Runnable() {
+                @Override
+                public void run() {
+                    toggleAutoUpdateFromUi();
+                }
+            });
+            Object auBtnLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(auBtnLp, 0, 0, 8, 0);
+            addView.invoke(expLeftBot, autoUpdateToggleBtn, auBtnLp);
 
             subnetCycleBtn = tvCtor.newInstance(sysContext);
             setTextViewStyle(subnetCycleBtn, "🌐 AP 서브넷: AUTO", 12.5f, 0xFF93C5FD, true);
@@ -2233,7 +2314,8 @@ public class UsbWifiStatusMain {
                 leftSb.append("• USB 랜카드 : ").append(usbStr).append("\n");
                 leftSb.append("• 드라이버 모듈 : ").append(drvStr).append("\n");
                 leftSb.append("• 인터페이스 : ").append(ifaceStr).append(" | 순정 wlan0 완벽 분리\n");
-                leftSb.append("• 백그라운드 데몬 : ").append(snap.daemonAlive ? ("🟢 PID " + snap.daemonPid) : "🔴 중지됨");
+                leftSb.append("• 백그라운드 데몬 : ").append(snap.daemonAlive ? ("🟢 PID " + snap.daemonPid) : "🔴 중지됨")
+                        .append("  |  GitHub OTA: v").append(UI_VERSION).append(" (").append(otaStatusSummary).append(")");
 
                 StringBuilder rightSb = new StringBuilder(512);
                 int maxLogs = Math.min(6, snap.recentLogs.size());
@@ -2241,6 +2323,24 @@ public class UsbWifiStatusMain {
                 for (int i = startIdx; i < snap.recentLogs.size(); i++) {
                     rightSb.append(snap.recentLogs.get(i));
                     if (i + 1 < snap.recentLogs.size()) rightSb.append("\n");
+                }
+
+                if (otaUpdateBtn != null) {
+                    if (otaCheckingOrUpdating) {
+                        setText.invoke(otaUpdateBtn, "⏳ 확인 중...");
+                        setRoundedBg(otaUpdateBtn, 0xFF334155, 0xFF94A3B8, 1, 11f);
+                    } else if (otaUpdateAvailable) {
+                        setText.invoke(otaUpdateBtn, "☁️ 업데이트 (NEW)");
+                        setRoundedBg(otaUpdateBtn, 0xFFD97706, 0xFFFBBF24, 1, 11f);
+                    } else {
+                        setText.invoke(otaUpdateBtn, "☁️ 업데이트");
+                        setRoundedBg(otaUpdateBtn, 0xFF4F46E5, 0xFF818CF8, 1, 11f);
+                    }
+                }
+                if (autoUpdateToggleBtn != null) {
+                    boolean autoOn = !"0".equals(snap.autoUpdate);
+                    setText.invoke(autoUpdateToggleBtn, autoOn ? "☁️ 자동업데이트: 켜짐" : "☁️ 자동업데이트: 꺼짐");
+                    setRoundedBg(autoUpdateToggleBtn, autoOn ? 0xFF312E81 : 0xFF1E293B, autoOn ? 0xFF6366F1 : 0xFF475569, 1, 8f);
                 }
 
                 setText.invoke(headerSysInfoTextView, "CPU " + snap.cpuLoadPct + "%  |  " + snap.ramSummary);
@@ -2578,6 +2678,193 @@ public class UsbWifiStatusMain {
                     postToUi(REFRESH_TASK);
                 }
             }, "RestartHotspotTrigger").start();
+        }
+
+        private static void toggleAutoUpdateFromUi() {
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        File confFile = new File(installDir, "config/hotspot.conf");
+                        Map<String, String> conf = parseKeyValueFile(confFile);
+                        boolean curOn = !"0".equals(stripQuotes(getOrDefault(conf, "AUTO_UPDATE", "1")));
+                        String nextVal = curOn ? "0" : "1";
+                        updateConfigKeys(confFile, new String[][]{
+                                {"AUTO_UPDATE", nextVal}
+                        });
+                        latestSnapshot = collectSnapshot(installDir);
+                        actionBannerMsg = "1".equals(nextVal)
+                                ? "☁️ GitHub 백그라운드 자동 업데이트가 [켜짐]으로 설정되었습니다."
+                                : "☁️ GitHub 백그라운드 자동 업데이트가 [꺼짐]으로 설정되었습니다.";
+                    } catch (Throwable t) {
+                        actionBannerMsg = "⚠️ 자동 업데이트 설정 변경 실패: " + t.getMessage();
+                    }
+                    postToUi(REFRESH_TASK);
+                }
+            }, "ToggleAutoUpdateThread").start();
+        }
+
+        private static void triggerGitHubOtaFromUi() {
+            if (otaCheckingOrUpdating) {
+                actionBannerMsg = "⏳ 이미 GitHub 업데이트 확인/다운로드가 진행 중입니다...";
+                postToUi(REFRESH_TASK);
+                return;
+            }
+            long now = System.currentTimeMillis();
+            final boolean forceReinstall = !otaUpdateAvailable && (now - lastManualOtaTapMs < 8000L);
+            lastManualOtaTapMs = now;
+
+            actionBannerMsg = forceReinstall
+                    ? "⬇️ GitHub(GRT47/HKG_5W_USB_Wlan)에서 최신 파일 강제 재설치 중..."
+                    : "⏳ GitHub(GRT47/HKG_5W_USB_Wlan)에서 최신 버전을 확인하고 있습니다...";
+            postToUi(REFRESH_TASK);
+
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    checkAndApplyGitHubOta(installDir, true, forceReinstall, false);
+                }
+            }, "ManualGitHubOtaThread").start();
+        }
+
+        public static void checkAndApplyGitHubOta(final String dir, boolean applyIfNew, boolean forceApply, boolean silentIfUpToDate) {
+            if (otaCheckingOrUpdating) return;
+            otaCheckingOrUpdating = true;
+            postToUi(REFRESH_TASK);
+            try {
+                ensureGitHubRoutingRule();
+                byte[] verBytes = downloadGitHubOtaFile("version.json", 8000);
+                Map<String, String> vmap = parseJsonFlatMap(new String(verBytes, UTF8));
+                String remoteVer = getOrDefault(vmap, "version", "");
+                String expJarSha = getOrDefault(vmap, "sha256_jar", "").toLowerCase(Locale.US);
+                String expDaemonSha = getOrDefault(vmap, "sha256_daemon", "").toLowerCase(Locale.US);
+                String expLaunchSha = getOrDefault(vmap, "sha256_launch", "").toLowerCase(Locale.US);
+                if (remoteVer.isEmpty() || expJarSha.length() != 64 || expDaemonSha.length() != 64) {
+                    throw new IOException("version.json 매니페스트 형식 오류");
+                }
+                otaRemoteVersion = remoteVer;
+
+                File localJar = new File(dir, "bin/usbwifistatus.jar");
+                File localDaemon = new File(dir, "svc/usbwifi-hotspot-daemon.sh");
+                File localLaunch = new File(dir, "bin/launch.sh");
+
+                String curJarSha = sha256File(localJar);
+                String curDaemonSha = sha256File(localDaemon);
+                String curLaunchSha = sha256File(localLaunch);
+
+                boolean jarChanged = !expJarSha.equalsIgnoreCase(curJarSha);
+                boolean daemonChanged = !expDaemonSha.equalsIgnoreCase(curDaemonSha);
+                boolean launchChanged = !expLaunchSha.isEmpty() && !expLaunchSha.equalsIgnoreCase(curLaunchSha);
+                boolean hasUpdate = jarChanged || daemonChanged || launchChanged;
+
+                String nowStr = new SimpleDateFormat("HH:mm", Locale.US).format(new Date());
+                if (!hasUpdate && !forceApply) {
+                    otaUpdateAvailable = false;
+                    otaStatusSummary = "최신 v" + remoteVer + " 확인됨 " + nowStr;
+                    if (!silentIfUpToDate) {
+                        actionBannerMsg = "✅ 현재 GitHub 최신 버전(v" + remoteVer + ")입니다! (8초 내 한 번 더 누르면 강제 재설치)";
+                    }
+                    otaCheckingOrUpdating = false;
+                    postToUi(REFRESH_TASK);
+                    return;
+                }
+
+                otaUpdateAvailable = hasUpdate;
+                if (!applyIfNew && !forceApply) {
+                    otaStatusSummary = "새 버전 v" + remoteVer + " 대기 중";
+                    actionBannerMsg = "☁️ GitHub에 새 업데이트(v" + remoteVer + ")가 있습니다! 상단 [☁️ 업데이트]를 누르세요.";
+                    otaCheckingOrUpdating = false;
+                    postToUi(REFRESH_TASK);
+                    return;
+                }
+
+                actionBannerMsg = "⬇️ GitHub 새 버전(v" + remoteVer + ") 다운로드 및 SHA-256 무결성 검증 중...";
+                postToUi(REFRESH_TASK);
+
+                // 1. Download & verify usbwifistatus.b64 -> decoded JAR bytes
+                byte[] b64Bytes = downloadGitHubOtaFile("usbwifistatus.b64", 15000);
+                byte[] newJarBytes = decodeBase64(new String(b64Bytes, UTF8));
+                String dlJarSha = sha256Hex(newJarBytes);
+                if (!expJarSha.equalsIgnoreCase(dlJarSha)) {
+                    throw new IOException("usbwifistatus.jar SHA-256 불일치 (" + dlJarSha.substring(0, 8) + ")");
+                }
+
+                // 2. Download & verify usbwifi-hotspot-daemon.sh
+                byte[] newDaemonBytes = downloadGitHubOtaFile("usbwifi-hotspot-daemon.sh", 10000);
+                String dlDaemonSha = sha256Hex(newDaemonBytes);
+                if (!expDaemonSha.equalsIgnoreCase(dlDaemonSha)) {
+                    throw new IOException("daemon.sh SHA-256 불일치 (" + dlDaemonSha.substring(0, 8) + ")");
+                }
+
+                // 3. Download & verify launch.sh
+                byte[] newLaunchBytes = null;
+                if (!expLaunchSha.isEmpty()) {
+                    newLaunchBytes = downloadGitHubOtaFile("launch.sh", 8000);
+                    String dlLaunchSha = sha256Hex(newLaunchBytes);
+                    if (!expLaunchSha.equalsIgnoreCase(dlLaunchSha)) {
+                        throw new IOException("launch.sh SHA-256 불일치 (" + dlLaunchSha.substring(0, 8) + ")");
+                    }
+                }
+
+                // 4. Backup & Atomic Replace (User config/hotspot.conf & saved_sta.conf are 100% untouched!)
+                if (localJar.isFile()) {
+                    writeBytesAtomic(new File(dir, "bin/usbwifistatus.jar.bak"), readAllBytes(new FileInputStream(localJar)));
+                }
+                if (localDaemon.isFile()) {
+                    writeBytesAtomic(new File(dir, "svc/usbwifi-hotspot-daemon.sh.bak"), readAllBytes(new FileInputStream(localDaemon)));
+                }
+                writeBytesAtomic(localJar, newJarBytes);
+                localJar.setReadable(true, false);
+
+                writeBytesAtomic(localDaemon, newDaemonBytes);
+                localDaemon.setReadable(true, false);
+                localDaemon.setExecutable(true, false);
+
+                if (newLaunchBytes != null) {
+                    writeBytesAtomic(localLaunch, newLaunchBytes);
+                    localLaunch.setReadable(true, false);
+                    localLaunch.setExecutable(true, false);
+                }
+                writeBytesAtomic(new File(dir, "config/version.json"), verBytes);
+                execCommandCapture(new String[]{"/system/bin/sh", "-c",
+                        "chmod 755 \"" + localDaemon.getAbsolutePath() + "\" \"" + localLaunch.getAbsolutePath() + "\" 2>/dev/null; "
+                                + "chmod 644 \"" + localJar.getAbsolutePath() + "\" 2>/dev/null; "
+                                + "echo \"$(date) [OTA] Updated to v" + remoteVer + " (jar=" + expJarSha.substring(0, 8) + ")\" >> /data/local/tmp/usbwifi_hotspot/daemon.log 2>/dev/null"
+                }, 5);
+
+                otaUpdateAvailable = false;
+                otaStatusSummary = "v" + remoteVer + " 업데이트 완료!";
+                actionBannerMsg = "✅ GitHub v" + remoteVer + " 업데이트 완료! 2초 후 새 버전으로 자동 재시작합니다...";
+                postToUi(REFRESH_TASK);
+
+                if (daemonChanged || forceApply) {
+                    writeBytesAtomic(new File(TMP_DIR_PATH, "ota_reload_daemon"), "1\n".getBytes(UTF8));
+                }
+                if (jarChanged || forceApply) {
+                    final boolean wasVisible = isVisible;
+                    Thread.sleep(1500L);
+                    if (wasVisible) {
+                        writeBytesAtomic(new File(TMP_DIR_PATH, "show_ui"), "1\n".getBytes(UTF8));
+                    }
+                    String relaunchCmd = "sleep 1; rm -f /data/local/tmp/usbwifi_hotspot/ui_java.lock /data/local/tmp/usbwifi_hotspot/ui_java.pid 2>/dev/null; "
+                            + "/system/bin/sh \"" + localLaunch.getAbsolutePath() + "\" >/dev/null 2>&1 &";
+                    new ProcessBuilder("/system/bin/sh", "-c", relaunchCmd).start();
+                    try {
+                        if (sInstanceLock != null) sInstanceLock.release();
+                        if (sLockFos != null) sLockFos.close();
+                    } catch (Throwable ignored) {
+                    }
+                    System.exit(0);
+                }
+            } catch (Throwable t) {
+                otaStatusSummary = "연결 확인 필요";
+                if (!silentIfUpToDate) {
+                    actionBannerMsg = "⚠️ GitHub 업데이트 실패: " + t.getMessage() + " (LTE 또는 Wi-Fi 인터넷 연결 확인)";
+                }
+            } finally {
+                otaCheckingOrUpdating = false;
+                postToUi(REFRESH_TASK);
+            }
         }
 
         private static void toggleSubnetFromUi() {
@@ -3116,6 +3403,361 @@ public class UsbWifiStatusMain {
         dst.setReadable(true, false);
     }
 
+    public static void ensureGitHubRoutingRule() {
+        try {
+            if (!new File("/system/bin/ip").exists()) return;
+            String cmd = "if ! ip rule show 2>/dev/null | grep -q '9800:.*lookup 62'; then "
+                    + "  _tbl=61; "
+                    + "  if ip route show table 60 2>/dev/null | grep -q '^default .* dev rmnet1'; then _tbl=60; "
+                    + "  elif ip route show table 61 2>/dev/null | grep -q '^default .* dev rmnet1'; then _tbl=61; fi; "
+                    + "  ip rule del pref 9850 2>/dev/null; "
+                    + "  ip rule del pref 9851 2>/dev/null; "
+                    + "  ip rule del pref 9852 2>/dev/null; "
+                    + "  ip rule add pref 9850 to 8.8.8.8/32 lookup $_tbl 2>/dev/null; "
+                    + "  ip rule add pref 9851 to 1.1.1.1/32 lookup $_tbl 2>/dev/null; "
+                    + "  ip rule add pref 9852 to 185.199.108.0/22 lookup $_tbl 2>/dev/null; "
+                    + "fi";
+            execCommandCapture(new String[]{"/system/bin/sh", "-c", cmd}, 5);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static final byte[][] GITHUB_ANYCAST_IPS = new byte[][]{
+            new byte[]{(byte) 185, (byte) 199, (byte) 108, (byte) 133},
+            new byte[]{(byte) 185, (byte) 199, (byte) 109, (byte) 133},
+            new byte[]{(byte) 185, (byte) 199, (byte) 110, (byte) 133},
+            new byte[]{(byte) 185, (byte) 199, (byte) 111, (byte) 133}
+    };
+
+    public static byte[] resolveHostViaPublicDns(String host, String dnsServerIp, int timeoutMs) {
+        DatagramSocket ds = null;
+        try {
+            ByteArrayOutputStream q = new ByteArrayOutputStream(64);
+            q.write(0x12);
+            q.write(0x34); // ID
+            q.write(0x01);
+            q.write(0x00); // Flags: standard query, recursion desired
+            q.write(0x00);
+            q.write(0x01); // QDCOUNT = 1
+            q.write(0x00);
+            q.write(0x00); // ANCOUNT = 0
+            q.write(0x00);
+            q.write(0x00); // NSCOUNT = 0
+            q.write(0x00);
+            q.write(0x00); // ARCOUNT = 0
+            String[] labels = host.split("\\.");
+            for (String lb : labels) {
+                byte[] b = lb.getBytes(UTF8);
+                q.write(b.length);
+                q.write(b);
+            }
+            q.write(0x00); // root label
+            q.write(0x00);
+            q.write(0x01); // QTYPE = A (1)
+            q.write(0x00);
+            q.write(0x01); // QCLASS = IN (1)
+
+            byte[] req = q.toByteArray();
+            String[] dparts = dnsServerIp.split("\\.");
+            byte[] dnsIp = new byte[]{
+                    (byte) Integer.parseInt(dparts[0]),
+                    (byte) Integer.parseInt(dparts[1]),
+                    (byte) Integer.parseInt(dparts[2]),
+                    (byte) Integer.parseInt(dparts[3])
+            };
+            ds = new DatagramSocket();
+            ds.setSoTimeout(timeoutMs);
+            ds.send(new DatagramPacket(req, req.length, InetAddress.getByAddress(dnsIp), 53));
+            byte[] resp = new byte[512];
+            DatagramPacket dp = new DatagramPacket(resp, resp.length);
+            ds.receive(dp);
+            int len = dp.getLength();
+            if (len < 12) return null;
+            int anCount = ((resp[6] & 0xFF) << 8) | (resp[7] & 0xFF);
+            if (anCount <= 0) return null;
+            int idx = 12;
+            while (idx < len && resp[idx] != 0) {
+                if ((resp[idx] & 0xC0) == 0xC0) {
+                    idx += 2;
+                    break;
+                }
+                idx += 1 + (resp[idx] & 0xFF);
+            }
+            if (idx < len && resp[idx] == 0) idx++;
+            idx += 4; // skip QTYPE + QCLASS
+            for (int a = 0; a < anCount && idx + 10 <= len; a++) {
+                if ((resp[idx] & 0xC0) == 0xC0) {
+                    idx += 2;
+                } else {
+                    while (idx < len && resp[idx] != 0) {
+                        idx += 1 + (resp[idx] & 0xFF);
+                    }
+                    idx++;
+                }
+                if (idx + 10 > len) break;
+                int rtype = ((resp[idx] & 0xFF) << 8) | (resp[idx + 1] & 0xFF);
+                int rdlen = ((resp[idx + 8] & 0xFF) << 8) | (resp[idx + 9] & 0xFF);
+                idx += 10;
+                if (rtype == 1 && rdlen == 4 && idx + 4 <= len) {
+                    return new byte[]{resp[idx], resp[idx + 1], resp[idx + 2], resp[idx + 3]};
+                }
+                idx += rdlen;
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (ds != null) try { ds.close(); } catch (Exception ignored) {}
+        }
+        return null;
+    }
+
+    public static byte[] downloadGitHubOtaFile(String fileName, int timeoutMs) throws Exception {
+        List<byte[]> candidateIps = new ArrayList<byte[]>();
+        byte[] dns1 = resolveHostViaPublicDns(GITHUB_RAW_HOST, "8.8.8.8", 2000);
+        if (dns1 != null) candidateIps.add(dns1);
+        byte[] dns2 = resolveHostViaPublicDns(GITHUB_RAW_HOST, "1.1.1.1", 2000);
+        if (dns2 != null) candidateIps.add(dns2);
+        for (byte[] anycast : GITHUB_ANYCAST_IPS) {
+            candidateIps.add(anycast);
+        }
+
+        TrustManager[] trustAll = new TrustManager[]{
+                new X509TrustManager() {
+                    @Override
+                    public void checkClientTrusted(X509Certificate[] chain, String authType) {
+                    }
+
+                    @Override
+                    public void checkServerTrusted(X509Certificate[] chain, String authType) {
+                    }
+
+                    @Override
+                    public X509Certificate[] getAcceptedIssuers() {
+                        return new X509Certificate[0];
+                    }
+                }
+        };
+        SSLContext sc;
+        try {
+            sc = SSLContext.getInstance("TLSv1.2");
+        } catch (Throwable ignored) {
+            sc = SSLContext.getInstance("TLS");
+        }
+        sc.init(null, trustAll, new SecureRandom());
+
+        Exception lastErr = null;
+        for (byte[] ipBytes : candidateIps) {
+            Socket tcpSock = null;
+            SSLSocket sslSock = null;
+            try {
+                InetAddress addr = InetAddress.getByAddress(GITHUB_RAW_HOST, ipBytes);
+                tcpSock = new Socket();
+                tcpSock.connect(new InetSocketAddress(addr, 443), timeoutMs);
+                tcpSock.setSoTimeout(timeoutMs);
+
+                sslSock = (SSLSocket) sc.getSocketFactory().createSocket(tcpSock, GITHUB_RAW_HOST, 443, true);
+                try {
+                    String[] sup = sslSock.getSupportedProtocols();
+                    List<String> en = new ArrayList<String>();
+                    for (String p : sup) {
+                        if ("TLSv1.2".equals(p) || "TLSv1.1".equals(p) || "TLSv1".equals(p)) {
+                            en.add(p);
+                        }
+                    }
+                    if (!en.isEmpty()) {
+                        sslSock.setEnabledProtocols(en.toArray(new String[en.size()]));
+                    }
+                } catch (Throwable ignored) {
+                }
+                try {
+                    sslSock.getClass().getMethod("setHostname", String.class).invoke(sslSock, GITHUB_RAW_HOST);
+                } catch (Throwable ignored) {
+                }
+                sslSock.startHandshake();
+
+                String reqPath = GITHUB_OTA_BASE_PATH + "/" + fileName + "?t=" + System.currentTimeMillis();
+                String httpReq = "GET " + reqPath + " HTTP/1.1\r\n"
+                        + "Host: " + GITHUB_RAW_HOST + "\r\n"
+                        + "User-Agent: HKG-Gen5W-USBWifi-OTA/" + UI_VERSION + "\r\n"
+                        + "Accept: */*\r\n"
+                        + "Cache-Control: no-cache, no-store\r\n"
+                        + "Connection: close\r\n\r\n";
+                sslSock.getOutputStream().write(httpReq.getBytes(UTF8));
+                sslSock.getOutputStream().flush();
+
+                InputStream in = sslSock.getInputStream();
+                String statusLine = readHttpLine(in);
+                if (statusLine == null || !statusLine.contains(" 200")) {
+                    throw new IOException("HTTP 상태 오류: " + statusLine);
+                }
+                int contentLen = -1;
+                boolean chunked = false;
+                while (true) {
+                    String hdr = readHttpLine(in);
+                    if (hdr == null || hdr.isEmpty()) break;
+                    String low = hdr.toLowerCase(Locale.US);
+                    if (low.startsWith("content-length:")) {
+                        contentLen = (int) parseLongSafe(hdr.substring(15).trim(), -1L);
+                    } else if (low.startsWith("transfer-encoding:") && low.contains("chunked")) {
+                        chunked = true;
+                    }
+                }
+                return readHttpBody(in, contentLen, chunked);
+            } catch (Exception e) {
+                lastErr = e;
+            } finally {
+                if (sslSock != null) try { sslSock.close(); } catch (Exception ignored) {}
+                if (tcpSock != null) try { tcpSock.close(); } catch (Exception ignored) {}
+            }
+        }
+        throw (lastErr != null) ? lastErr : new IOException("GitHub 서버 연결 실패");
+    }
+
+    private static String readHttpLine(InputStream in) throws IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(128);
+        int b;
+        boolean gotAny = false;
+        while ((b = in.read()) != -1) {
+            gotAny = true;
+            if (b == '\n') break;
+            if (b != '\r') bos.write(b);
+        }
+        if (!gotAny && bos.size() == 0) return null;
+        return new String(bos.toByteArray(), UTF8);
+    }
+
+    private static byte[] readHttpBody(InputStream in, int contentLen, boolean chunked) throws IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(contentLen > 0 ? contentLen : 16384);
+        byte[] buf = new byte[4096];
+        if (chunked) {
+            while (true) {
+                String line = readHttpLine(in);
+                if (line == null) break;
+                int semi = line.indexOf(';');
+                String hex = (semi > 0 ? line.substring(0, semi) : line).trim();
+                if (hex.isEmpty()) continue;
+                int chunkSize = (int) parseHexSafe(hex, 0L);
+                if (chunkSize <= 0) break;
+                int rem = chunkSize;
+                while (rem > 0) {
+                    int n = in.read(buf, 0, Math.min(buf.length, rem));
+                    if (n == -1) throw new IOException("Incomplete HTTP chunk");
+                    bos.write(buf, 0, n);
+                    rem -= n;
+                }
+                readHttpLine(in); // trailing CRLF
+            }
+        } else if (contentLen >= 0) {
+            int rem = contentLen;
+            while (rem > 0) {
+                int n = in.read(buf, 0, Math.min(buf.length, rem));
+                if (n == -1) throw new IOException("Incomplete HTTP body");
+                bos.write(buf, 0, n);
+                rem -= n;
+            }
+        } else {
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                bos.write(buf, 0, n);
+            }
+        }
+        return bos.toByteArray();
+    }
+
+    public static String sha256Hex(byte[] data) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] dig = md.digest(data);
+            StringBuilder sb = new StringBuilder(64);
+            for (byte b : dig) {
+                int v = b & 0xFF;
+                if (v < 16) sb.append('0');
+                sb.append(Integer.toHexString(v));
+            }
+            return sb.toString();
+        } catch (Throwable e) {
+            return "";
+        }
+    }
+
+    public static String sha256File(File f) {
+        if (f == null || !f.isFile()) return "";
+        try {
+            return sha256Hex(readAllBytes(new FileInputStream(f)));
+        } catch (Throwable e) {
+            return "";
+        }
+    }
+
+    private static final String B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    public static String encodeBase64(byte[] data) {
+        StringBuilder sb = new StringBuilder((data.length * 4) / 3 + 16);
+        int i = 0;
+        int lineLen = 0;
+        while (i < data.length) {
+            int b0 = data[i++] & 0xFF;
+            int b1 = (i < data.length) ? (data[i++] & 0xFF) : -1;
+            int b2 = (i < data.length) ? (data[i++] & 0xFF) : -1;
+            sb.append(B64_ALPHABET.charAt(b0 >>> 2));
+            sb.append(B64_ALPHABET.charAt(((b0 & 0x03) << 4) | (b1 >= 0 ? (b1 >>> 4) : 0)));
+            sb.append(b1 >= 0 ? B64_ALPHABET.charAt(((b1 & 0x0F) << 2) | (b2 >= 0 ? (b2 >>> 6) : 0)) : '=');
+            sb.append(b2 >= 0 ? B64_ALPHABET.charAt(b2 & 0x3F) : '=');
+            lineLen += 4;
+            if (lineLen >= 76 && i < data.length) {
+                sb.append('\n');
+                lineLen = 0;
+            }
+        }
+        return sb.toString();
+    }
+
+    public static byte[] decodeBase64(String b64) {
+        int[] rev = new int[128];
+        for (int i = 0; i < rev.length; i++) rev[i] = -1;
+        for (int i = 0; i < B64_ALPHABET.length(); i++) {
+            rev[B64_ALPHABET.charAt(i)] = i;
+        }
+        ByteArrayOutputStream bos = new ByteArrayOutputStream((b64.length() * 3) / 4);
+        int buf = 0;
+        int bits = 0;
+        for (int i = 0; i < b64.length(); i++) {
+            char c = b64.charAt(i);
+            if (c == '=') break;
+            if (c >= 128 || rev[c] < 0) continue;
+            buf = (buf << 6) | rev[c];
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                bos.write((buf >>> bits) & 0xFF);
+            }
+        }
+        return bos.toByteArray();
+    }
+
+    public static Map<String, String> parseJsonFlatMap(String json) {
+        Map<String, String> map = new LinkedHashMap<String, String>();
+        if (json == null) return map;
+        int i = 0;
+        int n = json.length();
+        while (i < n) {
+            int q1 = json.indexOf('"', i);
+            if (q1 < 0) break;
+            int q2 = json.indexOf('"', q1 + 1);
+            if (q2 < 0) break;
+            String key = json.substring(q1 + 1, q2);
+            int colon = json.indexOf(':', q2 + 1);
+            if (colon < 0) break;
+            int v1 = json.indexOf('"', colon + 1);
+            if (v1 < 0) break;
+            int v2 = json.indexOf('"', v1 + 1);
+            if (v2 < 0) break;
+            String val = json.substring(v1 + 1, v2);
+            map.put(key, val);
+            i = v2 + 1;
+        }
+        return map;
+    }
+
     public static int runSelfTest() throws Exception {
         String compact = compactLogLine("Sat Oct 31 14:13:50 +09:00 2026 Service started (pid=3563), monitoring USB 0bda:b812");
         if (!compact.startsWith("14:13:50 Service started")) {
@@ -3129,6 +3771,16 @@ public class UsbWifiStatusMain {
         String patchedStr = new String(patchHostapdBytes(sampleBin), UTF8);
         if (!patchedStr.contains("/data/local/tmp/usb_sta.list") || patchedStr.contains("/data/misc/wifi/all_sta.list")) {
             throw new AssertionError("patchHostapdBytes failed: " + patchedStr);
+        }
+        byte[] testPayload = "HKG_Gen5W_OTA_Test_Payload_1234567890".getBytes(UTF8);
+        String b64 = encodeBase64(testPayload);
+        byte[] decoded = decodeBase64(b64);
+        if (!sha256Hex(testPayload).equals(sha256Hex(decoded))) {
+            throw new AssertionError("Base64/SHA-256 self-test failed");
+        }
+        Map<String, String> jmap = parseJsonFlatMap("{\"version\": \"1.8.0\", \"sha256_jar\": \"abcd\"}");
+        if (!"1.8.0".equals(jmap.get("version")) || !"abcd".equals(jmap.get("sha256_jar"))) {
+            throw new AssertionError("parseJsonFlatMap failed");
         }
         System.out.println("USBWIFI STATUS UI SELF-TEST PASSED! (" + compact + ")");
         return 0;

@@ -1,0 +1,9 @@
+{
+  "version": "1.8.0",
+  "repo": "GRT47/HKG_5W_USB_Wlan",
+  "branch": "main",
+  "sha256_jar": "c8e2e8aca295a86782390df0f0364b4e15c92da77e6c03dc11a23173afbc25c2",
+  "sha256_daemon": "e484d38efa24fcc686f661ac0497d4c02971dd394cd6d4d3fb962c7e7b8ee65d",
+  "sha256_launch": "f178706c82d54480db7ed44041ffeaa2e9ea3e958ac1600dc850a4d385c4f9f4",
+  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode with GitHub OTA Auto-Update"
+}
