@@ -53,7 +53,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class UsbWifiStatusMain {
 
-    public static final String UI_VERSION = "2.0.0";
+    public static final String UI_VERSION = "2.0.1";
     public static final String GITHUB_RAW_HOST = "raw.githubusercontent.com";
     public static final String GITHUB_OTA_BASE_PATH = "/GRT47/HKG_5W_USB_Wlan/main/ota";
     private static final Charset UTF8 = Charset.forName("UTF-8");
@@ -1021,11 +1021,32 @@ public class UsbWifiStatusMain {
 
         public static void showFromMapLongPress(final String detail) {
             try {
-                latestSnapshot = collectSnapshot(installDir);
+                if (latestSnapshot == null) {
+                    latestSnapshot = collectSnapshot(installDir);
+                }
             } catch (Throwable ignored) {
             }
             actionBannerMsg = "🗺️ 헤드유닛 [MAP] 버튼 3초 롱프레스 감지 — 대시보드가 실행되었습니다. (" + detail + ")";
             show();
+        }
+
+        public static void ensureTopMostAfterKeyUp() {
+            postDelayedToUi(new Runnable() {
+                @Override
+                public void run() {
+                    if (isVisible) {
+                        showOnUiThread();
+                    }
+                }
+            }, 250L);
+        }
+
+        public static void hideIfOpenForMoreThan(final long minOpenMs) {
+            if (!isVisible) return;
+            long now = System.currentTimeMillis();
+            if (shownAtMs > 0L && (now - shownAtMs) >= minOpenMs) {
+                hide();
+            }
         }
 
         private static boolean ensureUiContextOnUiThread() {
@@ -2126,10 +2147,19 @@ public class UsbWifiStatusMain {
                     }, 500L);
                     return;
                 }
-                if (isVisible && rootOverlayView != null) {
+                if (isVisible && rootOverlayView != null && isEditModalOpen) {
                     shownAtMs = System.currentTimeMillis();
                     refreshOnUiThread();
                     return;
+                }
+                if (rootOverlayView != null) {
+                    try {
+                        Class<?> viewCls0 = Class.forName("android.view.View");
+                        windowManager.getClass().getMethod("removeViewImmediate", viewCls0).invoke(windowManager, rootOverlayView);
+                    } catch (Throwable ignored) {
+                    }
+                    rootOverlayView = null;
+                    isVisible = false;
                 }
 
                 Class<?> viewCls = Class.forName("android.view.View");
@@ -3974,7 +4004,7 @@ public class UsbWifiStatusMain {
                         }
                         knownNonMapCodes.remove(Integer.valueOf(code));
                     } else if (isExplicitNonMapKeyName(keyName)) {
-                        if (isDeviceSpecific || !knownMapCodes.contains(code)) {
+                        if (!knownMapCodes.contains(code)) {
                             if (!knownNonMapCodes.contains(code)) {
                                 knownNonMapCodes.add(code);
                             }
@@ -4018,6 +4048,28 @@ public class UsbWifiStatusMain {
             return false;
         }
 
+        private static String detectVehicleFasciaPrefix() {
+            File inputDir = new File("/sys/class/input");
+            File[] files = inputDir.listFiles();
+            if (files == null) return "";
+            for (File f : files) {
+                if (!f.getName().startsWith("event")) continue;
+                String devName = readFirstLineQuick(new File(f, "device/name")).toLowerCase(Locale.US).trim();
+                if (devName.startsWith("daudio_wp_") && !devName.endsWith("_can") && !devName.endsWith("_knob")) {
+                    String prefix = devName;
+                    String[] suffixes = new String[]{"_kr", "_eu", "_us", "_cn", "_in", "_au", "_me", "_ru", "_br", "_gen", "_base"};
+                    for (String sfx : suffixes) {
+                        if (prefix.endsWith(sfx) && prefix.length() > sfx.length()) {
+                            prefix = prefix.substring(0, prefix.length() - sfx.length());
+                            break;
+                        }
+                    }
+                    return prefix;
+                }
+            }
+            return "";
+        }
+
         private static void loadSystemKeyLayouts(String installDir) {
             try {
                 File confFile = new File(installDir, "config/hotspot.conf");
@@ -4035,8 +4087,10 @@ public class UsbWifiStatusMain {
             } catch (Throwable ignored) {
             }
 
+            String vehiclePrefix = detectVehicleFasciaPrefix();
             String[] klDirs = new String[]{"/system/usr/keylayout", "/vendor/usr/keylayout"};
-            List<File> specificFiles = new ArrayList<File>();
+            List<File> matchedFiles = new ArrayList<File>();
+            List<File> fallbackFiles = new ArrayList<File>();
             List<File> genericFiles = new ArrayList<File>();
             for (String dirPath : klDirs) {
                 File dir = new File(dirPath);
@@ -4045,31 +4099,37 @@ public class UsbWifiStatusMain {
                 for (File f : files) {
                     if (!f.isFile() || !f.getName().endsWith(".kl")) continue;
                     String low = f.getName().toLowerCase(Locale.US);
-                    if (low.contains("daudio") || low.contains("tcc") || low.contains("gpio")
-                            || low.contains("keypad") || low.contains("mobis") || low.contains("hkmc")) {
-                        specificFiles.add(f);
-                    } else if ("generic.kl".equals(low)) {
+                    if ("generic.kl".equals(low)) {
                         genericFiles.add(f);
+                    } else if (!vehiclePrefix.isEmpty() && low.startsWith(vehiclePrefix + "_")) {
+                        matchedFiles.add(f);
+                    } else if (low.contains("daudio") || low.contains("tcc") || low.contains("gpio")
+                            || low.contains("keypad") || low.contains("mobis") || low.contains("hkmc")) {
+                        fallbackFiles.add(f);
                     }
                 }
             }
 
-            // Load Generic.kl first, then override with device-specific daudio_wp_daudioplus*.kl
+            // Load Generic.kl first, then vehicle-matched .kl (or fallback .kl files if no exact match)
             for (File gf : genericFiles) {
                 parseKeyLayoutLines(gf.getName(), readLinesQuick(gf, 600), false);
             }
-            for (File sf : specificFiles) {
+            List<File> activeSpecific = !matchedFiles.isEmpty() ? matchedFiles : fallbackFiles;
+            for (File sf : activeSpecific) {
                 List<String> lines = readLinesQuick(sf, 400);
                 parseKeyLayoutLines(sf.getName(), lines, true);
-                appendKeyLog("[KL-Loaded] " + sf.getName() + " (" + lines.size() + " lines)");
-                for (String ln : lines) {
-                    String t = ln.trim();
-                    if (t.startsWith("key ")) {
-                        appendKeyLog("  " + sf.getName() + ": " + t);
+                if (!matchedFiles.isEmpty()) {
+                    appendKeyLog("[KL-Matched] " + sf.getName() + " (prefix=" + vehiclePrefix + ", " + lines.size() + " lines)");
+                    for (String ln : lines) {
+                        String t = ln.trim();
+                        if (t.startsWith("key ")) {
+                            appendKeyLog("  " + sf.getName() + ": " + t);
+                        }
                     }
                 }
             }
-            appendKeyLog("[KL-Summary] knownMapCodes=" + knownMapCodes + ", knownMapLongCodes=" + knownMapLongCodes);
+            appendKeyLog("[KL-Summary] prefix='" + vehiclePrefix + "' matched=" + matchedFiles.size()
+                    + " knownMapCodes=" + knownMapCodes + ", knownMapLongCodes=" + knownMapLongCodes);
         }
 
         public static boolean isEligibleMapKey(String devName, boolean isFasciaDevice, int code) {
@@ -4098,6 +4158,8 @@ public class UsbWifiStatusMain {
         public static boolean onKeyEvent(String devName, boolean isFasciaDevice, int code, int value, long nowMs, boolean isSelfTest) {
             if (code <= 0) return false;
             boolean triggerNow = false;
+            boolean postReleaseEnsureTop = false;
+            boolean shortPressDismiss = false;
             String triggerDetail = "";
 
             synchronized (STATE_LOCK) {
@@ -4112,6 +4174,10 @@ public class UsbWifiStatusMain {
                         activeCode = -1;
                         holdStartMs = 0L;
                         pulseCount = 0;
+                        shortPressDismiss = true;
+                    }
+                    if (shortPressDismiss && !isSelfTest) {
+                        StatusDashboardOverlay.hideIfOpenForMoreThan(1500L);
                     }
                     return false;
                 }
@@ -4175,10 +4241,15 @@ public class UsbWifiStatusMain {
                     }
                 } else if (value == 0) { // KEY_UP
                     if (activeCode == code) {
-                        if (!holdTriggered && holdStartMs > 0L && (nowMs - holdStartMs) >= HOLD_DURATION_MS) {
+                        long heldMs = holdStartMs > 0L ? (nowMs - holdStartMs) : 0L;
+                        if (!holdTriggered && holdStartMs > 0L && heldMs >= HOLD_DURATION_MS) {
                             holdTriggered = true;
                             triggerNow = true;
-                            triggerDetail = "EV_KEY release after " + ((nowMs - holdStartMs) / 1000.0) + "s (code=" + code + ")";
+                            triggerDetail = "EV_KEY release after " + (heldMs / 1000.0) + "s (code=" + code + ")";
+                        } else if (holdTriggered) {
+                            postReleaseEnsureTop = true;
+                        } else if (heldMs > 0L && heldMs < 900L && pulseCount <= 1) {
+                            shortPressDismiss = true;
                         }
                         lastReleaseMs = nowMs;
                         lastReleasedCode = code;
@@ -4189,6 +4260,10 @@ public class UsbWifiStatusMain {
 
             if (triggerNow) {
                 fireDashboardTrigger(triggerDetail, nowMs, isSelfTest);
+            } else if (postReleaseEnsureTop && !isSelfTest) {
+                StatusDashboardOverlay.ensureTopMostAfterKeyUp();
+            } else if (shortPressDismiss && !isSelfTest) {
+                StatusDashboardOverlay.hideIfOpenForMoreThan(1500L);
             }
             return triggerNow;
         }
@@ -4226,8 +4301,8 @@ public class UsbWifiStatusMain {
                 return;
             }
             synchronized (STATE_LOCK) {
-                if (nowMs - lastPopupTriggerMs < 3500L) {
-                    return; // Debounce duplicate triggers within 3.5s
+                if (nowMs - lastPopupTriggerMs < 2000L) {
+                    return; // Debounce duplicate triggers within 2.0s
                 }
                 lastPopupTriggerMs = nowMs;
             }

@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.0)
+# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.1)
 export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin
 export LD_LIBRARY_PATH=/vendor/lib:/system/lib
 export ANDROID_ROOT=/system
@@ -815,6 +815,20 @@ is_ap_healthy() {
     return 0
 }
 
+ensure_ui_daemon_running() {
+    local _upid _ui_alive=0
+    if [ -f "$TMP_DIR/ui_java.pid" ]; then
+        read -r _upid < "$TMP_DIR/ui_java.pid" 2>/dev/null
+        if [ -n "$_upid" ] && [ -d "/proc/$_upid" ] && kill -0 "$_upid" 2>/dev/null; then
+            _ui_alive=1
+        fi
+    fi
+    if [ "$_ui_alive" = "0" ]; then
+        CLASSPATH="$APP_DIR/bin/usbwifistatus.jar" /system/bin/app_process /system/bin com.hkg.usbwifi.UsbWifiStatusMain daemon "$APP_DIR" </dev/null >>"$TMP_DIR/ui.log" 2>&1 &
+        echo $! > "$TMP_DIR/ui_java.pid" 2>/dev/null
+    fi
+}
+
 log_info "Service started (pid=$$), monitoring USB Wi-Fi (88x2bu + 8851bu/8831bu)"
 # Pre-load 88x2bu and 8851bu drivers immediately at boot (before Android Auto / system_server starts)
 # so usb_driver is registered and blocks usbfs AOA Request 51/52/53 on any hotplug
@@ -826,10 +840,12 @@ while [ "$(getprop sys.boot_completed)" != "1" ]; do
 done
 
 ensure_hostapd_usb_binary
+ensure_ui_daemon_running
 
 LAST_USB_SYNC=0
 SNAP_TICK=0
 while true; do
+    ensure_ui_daemon_running
     if [ -f "$TMP_DIR/ota_reload_daemon" ]; then
         rm -f "$TMP_DIR/ota_reload_daemon" "$TMP_DIR/daemon.pid" 2>/dev/null
         log_info "OTA update applied -> re-executing usbwifi-hotspot-daemon.sh"

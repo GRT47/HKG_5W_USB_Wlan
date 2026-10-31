@@ -103,9 +103,12 @@ def build_status_ui_jar() -> Path:
         check=True,
     )
 
-    class_files = [str(p) for p in sorted(CLASSES_DIR.rglob("*.class"))]
+    input_classes_jar = BUILD_DIR / "input_classes.jar"
+    with zipfile.ZipFile(input_classes_jar, "w", compression=zipfile.ZIP_STORED) as zf:
+        for p in sorted(CLASSES_DIR.rglob("*.class")):
+            zf.write(p, p.relative_to(CLASSES_DIR).as_posix())
     subprocess.run(
-        [d8, "--min-api", "19", "--no-desugaring", "--output", str(DEX_DIR), *class_files],
+        [d8, "--min-api", "19", "--no-desugaring", "--output", str(DEX_DIR), str(input_classes_jar)],
         check=True,
     )
 
@@ -354,11 +357,13 @@ def build() -> None:
         "rm -f \"$TMP_DIR/ui_java.lock\" 2>/dev/null\n"
         "sleep 1\n"
         "/system/bin/sh \"$APP_DIR/svc/usbwifi-hotspot-daemon.sh\" </dev/null >>\"$TMP_DIR/daemon_stdout.log\" 2>&1 &\n"
+        "CLASSPATH=\"$APP_DIR/bin/usbwifistatus.jar\" /system/bin/app_process /system/bin com.hkg.usbwifi.UsbWifiStatusMain daemon \"$APP_DIR\" </dev/null >>\"$TMP_DIR/ui.log\" 2>&1 &\n"
+        "echo $! > \"$TMP_DIR/ui_java.pid\" 2>/dev/null\n"
         "\n"
         "if [ -d /storage/usb0 ]; then\n"
         "    ULOG=\"/storage/usb0/usbwifi_hotspot_log\"\n"
         "    mkdir -p \"$ULOG\" 2>/dev/null\n"
-        "    echo \"Installed v2.0.0 at $(date)\" > \"$ULOG/install_ok.txt\" 2>/dev/null\n"
+        "    echo \"Installed v2.0.1 at $(date)\" > \"$ULOG/install_ok.txt\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.log \"$ULOG/\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.txt \"$ULOG/\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.conf \"$ULOG/\" 2>/dev/null\n"
@@ -460,7 +465,7 @@ def build() -> None:
     # 6. Background service daemon (svc/usbwifi-hotspot-daemon.sh)
     daemon_sh = (
         "#!/system/bin/sh\n"
-        "# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.0)\n"
+        "# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.1)\n"
         "export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin\n"
         "export LD_LIBRARY_PATH=/vendor/lib:/system/lib\n"
         "export ANDROID_ROOT=/system\n"
@@ -1276,6 +1281,20 @@ def build() -> None:
         "    return 0\n"
         "}\n"
         "\n"
+        "ensure_ui_daemon_running() {\n"
+        "    local _upid _ui_alive=0\n"
+        "    if [ -f \"$TMP_DIR/ui_java.pid\" ]; then\n"
+        "        read -r _upid < \"$TMP_DIR/ui_java.pid\" 2>/dev/null\n"
+        "        if [ -n \"$_upid\" ] && [ -d \"/proc/$_upid\" ] && kill -0 \"$_upid\" 2>/dev/null; then\n"
+        "            _ui_alive=1\n"
+        "        fi\n"
+        "    fi\n"
+        "    if [ \"$_ui_alive\" = \"0\" ]; then\n"
+        "        CLASSPATH=\"$APP_DIR/bin/usbwifistatus.jar\" /system/bin/app_process /system/bin com.hkg.usbwifi.UsbWifiStatusMain daemon \"$APP_DIR\" </dev/null >>\"$TMP_DIR/ui.log\" 2>&1 &\n"
+        "        echo $! > \"$TMP_DIR/ui_java.pid\" 2>/dev/null\n"
+        "    fi\n"
+        "}\n"
+        "\n"
         "log_info \"Service started (pid=$$), monitoring USB Wi-Fi (88x2bu + 8851bu/8831bu)\"\n"
         "# Pre-load 88x2bu and 8851bu drivers immediately at boot (before Android Auto / system_server starts)\n"
         "# so usb_driver is registered and blocks usbfs AOA Request 51/52/53 on any hotplug\n"
@@ -1287,10 +1306,12 @@ def build() -> None:
         "done\n"
         "\n"
         "ensure_hostapd_usb_binary\n"
+        "ensure_ui_daemon_running\n"
         "\n"
         "LAST_USB_SYNC=0\n"
         "SNAP_TICK=0\n"
         "while true; do\n"
+        "    ensure_ui_daemon_running\n"
         "    if [ -f \"$TMP_DIR/ota_reload_daemon\" ]; then\n"
         "        rm -f \"$TMP_DIR/ota_reload_daemon\" \"$TMP_DIR/daemon.pid\" 2>/dev/null\n"
         "        log_info \"OTA update applied -> re-executing usbwifi-hotspot-daemon.sh\"\n"
@@ -1417,13 +1438,13 @@ def build() -> None:
 
     version_manifest = json.dumps(
         {
-            "version": "2.0.0",
+            "version": "2.0.1",
             "repo": "GRT47/HKG_5W_USB_Wlan",
             "branch": "main",
             "sha256_jar": sha256_jar,
             "sha256_daemon": sha256_daemon,
             "sha256_launch": sha256_launch,
-            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (RTL8812BU/8822BU + RTL8831BU/8851BU Support)",
+            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (RTL8812BU/8822BU + RTL8831BU/8851BU Support + MAP Long-Press Auto-Daemon & Z-Order Fix)",
         },
         indent=2,
         ensure_ascii=False,
