@@ -53,7 +53,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class UsbWifiStatusMain {
 
-    public static final String UI_VERSION = "1.8.0";
+    public static final String UI_VERSION = "1.9.0";
     public static final String GITHUB_RAW_HOST = "raw.githubusercontent.com";
     public static final String GITHUB_OTA_BASE_PATH = "/GRT47/HKG_5W_USB_Wlan/main/ota";
     private static final Charset UTF8 = Charset.forName("UTF-8");
@@ -922,6 +922,17 @@ public class UsbWifiStatusMain {
             }, "UsbWifiStatusUiThread");
             uiThread.setDaemon(true);
             uiThread.start();
+
+            MapButtonLongPressMonitor.start(dir);
+        }
+
+        public static void showFromMapLongPress(final String detail) {
+            try {
+                latestSnapshot = collectSnapshot(installDir);
+            } catch (Throwable ignored) {
+            }
+            actionBannerMsg = "🗺️ 헤드유닛 [MAP] 버튼 3초 롱프레스 감지 — 대시보드가 실행되었습니다. (" + detail + ")";
+            show();
         }
 
         private static boolean ensureUiContextOnUiThread() {
@@ -3758,6 +3769,608 @@ public class UsbWifiStatusMain {
         return map;
     }
 
+    /**
+     * Physical [MAP] Button 3-Second Long-Press Monitor for Gen5W Head Units.
+     *
+     * Monitors:
+     *  1. Linux /dev/input/event* physical key devices (specifically daudio_wp_daudioplus_<model>_kr on event1,
+     *     telechips keypad / gpio-keys-polled on event0, and daudio_wp_daudioplus_<model>_kr_can on event2,
+     *     while excluding touchscreens and rotary knobs).
+     *  2. Android KeyLayout (.kl) files in /system/usr/keylayout/ and /vendor/usr/keylayout/ to map scanCodes
+     *     to MAP / HKMC_MAP / KEY_MAP vs non-MAP keys (VOLUME, POWER, SEEK, TRACK, RADIO, MEDIA, SETUP, STAR, CALL).
+     *  3. Logcat ModeManagerService / PhoneWindowManager / WindowManager / MicomD key events as a secondary source.
+     *
+     * Supports all 3 hardware hold behaviors for >= 3,000 ms (3.0 seconds):
+     *  - Mode A: Continuous EV_KEY hold (value=1 held for >= 3,000 ms before value=0).
+     *  - Mode B: Micom short-to-long keycode handoff (C_short held -> C_long keycode emitted while holding).
+     *  - Mode C: Rapid repeat pulses (value=1 -> value=0 repeated every <550 ms for >= 3,000 ms).
+     */
+    public static final class MapButtonLongPressMonitor {
+        public static final long HOLD_DURATION_MS = 3000L;
+        private static final Object STATE_LOCK = new Object();
+        private static volatile boolean started = false;
+        private static String sInstallDir = "/data/nemesis/apps/usbwifi.hotspot";
+
+        // Keycode classification tables populated from .kl files & hotspot.conf
+        private static final Map<Integer, String> codeToKlName = new LinkedHashMap<Integer, String>();
+        private static final List<Integer> knownMapCodes = new ArrayList<Integer>();
+        private static final List<Integer> knownMapLongCodes = new ArrayList<Integer>();
+        private static final List<Integer> knownNonMapCodes = new ArrayList<Integer>();
+        private static final List<Integer> rawNaviCodes = new ArrayList<Integer>();
+        private static final List<String> activeReaderPaths = new ArrayList<String>();
+
+        // Hold state machine variables (guarded by STATE_LOCK)
+        private static String activeDevName = "";
+        private static int activeCode = -1;
+        private static long holdStartMs = 0L;
+        private static long lastEventMs = 0L;
+        private static long lastReleaseMs = 0L;
+        private static int lastReleasedCode = -1;
+        private static int pulseCount = 0;
+        private static boolean holdTriggered = false;
+        private static long lastPopupTriggerMs = 0L;
+        public static volatile int selfTestTriggerCount = 0;
+
+        static {
+            initDefaultNonMapCodes();
+        }
+
+        private static void initDefaultNonMapCodes() {
+            // Standard Linux <linux/input.h> non-MAP keys (Back/Esc, Enter, Home, D-Pad, Vol, Mute, Power, Media, Call, Touch)
+            int[] stdNonMap = new int[]{
+                    1, 28, 102, 103, 104, 105, 106, 107, 108,
+                    113, 114, 115, 116, 139, 142, 158,
+                    163, 164, 165, 166, 167, 168,
+                    200, 201, 207, 208, 231, 330
+            };
+            for (int c : stdNonMap) {
+                if (!knownNonMapCodes.contains(c)) {
+                    knownNonMapCodes.add(c);
+                }
+            }
+        }
+
+        public static void resetForSelfTest() {
+            synchronized (STATE_LOCK) {
+                codeToKlName.clear();
+                knownMapCodes.clear();
+                knownMapLongCodes.clear();
+                knownNonMapCodes.clear();
+                rawNaviCodes.clear();
+                initDefaultNonMapCodes();
+                activeDevName = "";
+                activeCode = -1;
+                holdStartMs = 0L;
+                lastEventMs = 0L;
+                lastReleaseMs = 0L;
+                lastReleasedCode = -1;
+                pulseCount = 0;
+                holdTriggered = false;
+                lastPopupTriggerMs = 0L;
+                selfTestTriggerCount = 0;
+            }
+        }
+
+        public static void parseKeyLayoutLines(String fileName, List<String> lines, boolean isDeviceSpecific) {
+            if (lines == null) return;
+            synchronized (STATE_LOCK) {
+                for (String raw : lines) {
+                    if (raw == null) continue;
+                    String line = raw.trim();
+                    int hash = line.indexOf('#');
+                    if (hash >= 0) {
+                        line = line.substring(0, hash).trim();
+                    }
+                    if (!line.startsWith("key ")) continue;
+                    String[] parts = line.split("\\s+");
+                    if (parts.length < 3) continue;
+                    int code = (int) parseLongSafe(parts[1], -1L);
+                    if (code <= 0) continue;
+                    String keyName = parts[2].trim().toUpperCase(Locale.US);
+
+                    if (isDeviceSpecific || !codeToKlName.containsKey(code)) {
+                        codeToKlName.put(code, keyName + (isDeviceSpecific ? ("@" + fileName) : ""));
+                    }
+
+                    if (keyName.contains("MAP")) {
+                        if (!knownMapCodes.contains(code)) {
+                            knownMapCodes.add(code);
+                        }
+                        if (keyName.contains("LONG") && !knownMapLongCodes.contains(code)) {
+                            knownMapLongCodes.add(code);
+                        }
+                        knownNonMapCodes.remove(Integer.valueOf(code));
+                    } else if (isExplicitNonMapKeyName(keyName)) {
+                        if (isDeviceSpecific || !knownMapCodes.contains(code)) {
+                            if (!knownNonMapCodes.contains(code)) {
+                                knownNonMapCodes.add(code);
+                            }
+                        }
+                    } else if (keyName.contains("NAVI") && isDeviceSpecific) {
+                        if (!rawNaviCodes.contains(code)) {
+                            rawNaviCodes.add(code);
+                        }
+                    }
+                }
+                // If a device-specific .kl had an explicit *MAP* key, treat separate NAVI key as non-MAP
+                if (!knownMapCodes.isEmpty()) {
+                    for (Integer nc : rawNaviCodes) {
+                        if (!knownMapCodes.contains(nc) && !knownNonMapCodes.contains(nc)) {
+                            knownNonMapCodes.add(nc);
+                        }
+                    }
+                } else {
+                    for (Integer nc : rawNaviCodes) {
+                        if (!knownMapCodes.contains(nc)) {
+                            knownMapCodes.add(nc);
+                        }
+                    }
+                }
+            }
+        }
+
+        private static boolean isExplicitNonMapKeyName(String upper) {
+            String[] nonMapTokens = new String[]{
+                    "VOLUME", "VOL_", "MUTE", "POWER", "SLEEP", "WAKE",
+                    "MEDIA", "MUSIC", "AUDIO", "VIDEO", "RADIO", "DMB", "TUNER", "FM", "AM",
+                    "SEEK", "TRACK", "NEXT", "PREV", "FASTFORWARD", "REWIND", "PLAY", "PAUSE", "STOP",
+                    "SETUP", "SETTING", "CONFIG", "STAR", "CUSTOM", "FAVORITE", "UVO", "BLUELINK",
+                    "CALL", "ENDCALL", "PHONE", "HEADSET", "HOOK", "VOICE", "VR", "PTT",
+                    "HOME", "BACK", "ESCAPE", "MENU", "DISP", "CAMERA", "HAZARD", "EJECT", "TUNE", "KNOB",
+                    "DPAD", "ENTER", "SPACE", "DEL", "TAB", "SHIFT", "CTRL", "ALT"
+            };
+            for (String tok : nonMapTokens) {
+                if (upper.contains(tok)) return true;
+            }
+            return false;
+        }
+
+        private static void loadSystemKeyLayouts(String installDir) {
+            try {
+                File confFile = new File(installDir, "config/hotspot.conf");
+                Map<String, String> conf = parseKeyValueFile(confFile);
+                String customCodeStr = stripQuotes(getOrDefault(conf, "MAP_KEY_CODE", "AUTO"));
+                int customCode = (int) parseLongSafe(customCodeStr, -1L);
+                if (customCode > 0) {
+                    synchronized (STATE_LOCK) {
+                        if (!knownMapCodes.contains(customCode)) {
+                            knownMapCodes.add(customCode);
+                        }
+                        knownNonMapCodes.remove(Integer.valueOf(customCode));
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+
+            String[] klDirs = new String[]{"/system/usr/keylayout", "/vendor/usr/keylayout"};
+            List<File> specificFiles = new ArrayList<File>();
+            List<File> genericFiles = new ArrayList<File>();
+            for (String dirPath : klDirs) {
+                File dir = new File(dirPath);
+                File[] files = dir.listFiles();
+                if (files == null) continue;
+                for (File f : files) {
+                    if (!f.isFile() || !f.getName().endsWith(".kl")) continue;
+                    String low = f.getName().toLowerCase(Locale.US);
+                    if (low.contains("daudio") || low.contains("tcc") || low.contains("gpio")
+                            || low.contains("keypad") || low.contains("mobis") || low.contains("hkmc")) {
+                        specificFiles.add(f);
+                    } else if ("generic.kl".equals(low)) {
+                        genericFiles.add(f);
+                    }
+                }
+            }
+
+            // Load Generic.kl first, then override with device-specific daudio_wp_daudioplus*.kl
+            for (File gf : genericFiles) {
+                parseKeyLayoutLines(gf.getName(), readLinesQuick(gf, 600), false);
+            }
+            for (File sf : specificFiles) {
+                List<String> lines = readLinesQuick(sf, 400);
+                parseKeyLayoutLines(sf.getName(), lines, true);
+                appendKeyLog("[KL-Loaded] " + sf.getName() + " (" + lines.size() + " lines)");
+                for (String ln : lines) {
+                    String t = ln.trim();
+                    if (t.startsWith("key ")) {
+                        appendKeyLog("  " + sf.getName() + ": " + t);
+                    }
+                }
+            }
+            appendKeyLog("[KL-Summary] knownMapCodes=" + knownMapCodes + ", knownMapLongCodes=" + knownMapLongCodes);
+        }
+
+        public static boolean isEligibleMapKey(String devName, boolean isFasciaDevice, int code) {
+            synchronized (STATE_LOCK) {
+                if (knownMapCodes.contains(code) || knownMapLongCodes.contains(code)) {
+                    return true;
+                }
+                if (knownNonMapCodes.contains(code)) {
+                    return false;
+                }
+                if (!isFasciaDevice) {
+                    // On CAN / steering wheel devices, only trigger on explicitly mapped MAP keycodes
+                    return false;
+                }
+                // On the front fascia keypad (daudio_wp_daudioplus_<model>_kr / event1):
+                // All non-MAP buttons (RADIO, MEDIA, SEEK, TRACK, SETUP, STAR, POWER, VOL) are in knownNonMapCodes.
+                // Even if .kl did not use the literal substring "MAP" for the MAP button (or uses a separate scanCode),
+                // any remaining fascia button on event1/event0 is eligible as the MAP button!
+                return true;
+            }
+        }
+
+        /**
+         * Processes an EV_KEY event (type == 1) and returns true if the 3.0s hold trigger just fired synchronously.
+         */
+        public static boolean onKeyEvent(String devName, boolean isFasciaDevice, int code, int value, long nowMs, boolean isSelfTest) {
+            if (code <= 0) return false;
+            boolean triggerNow = false;
+            String triggerDetail = "";
+
+            synchronized (STATE_LOCK) {
+                boolean eligible = isEligibleMapKey(devName, isFasciaDevice, code);
+                boolean isHandoffCandidate = isFasciaDevice
+                        && !knownNonMapCodes.contains(code)
+                        && (activeCode != -1 || (holdStartMs > 0L && (nowMs - lastReleaseMs) <= 600L));
+
+                if (!eligible && !isHandoffCandidate) {
+                    // A non-MAP key was pressed on the fascia; cancel any unconfirmed pulse chain
+                    if (value == 1 && isFasciaDevice) {
+                        activeCode = -1;
+                        holdStartMs = 0L;
+                        pulseCount = 0;
+                    }
+                    return false;
+                }
+
+                if (value == 1) { // KEY_DOWN
+                    if (activeCode == code) {
+                        // Repeated value=1 while already held down; keep original holdStartMs
+                        lastEventMs = nowMs;
+                        if (!holdTriggered && holdStartMs > 0L && (nowMs - holdStartMs) >= HOLD_DURATION_MS) {
+                            holdTriggered = true;
+                            triggerNow = true;
+                            triggerDetail = "EV_KEY repeat-down code=" + code + " (" + ((nowMs - holdStartMs) / 1000.0) + "s)";
+                        }
+                    } else if (activeCode != -1 && activeCode != code) {
+                        // Handoff from short keycode to long keycode while still held down
+                        activeCode = code;
+                        activeDevName = devName;
+                        lastEventMs = nowMs;
+                        if (!holdTriggered && holdStartMs > 0L && (nowMs - holdStartMs) >= HOLD_DURATION_MS) {
+                            holdTriggered = true;
+                            triggerNow = true;
+                            triggerDetail = "EV_KEY handoff code=" + code + " (" + ((nowMs - holdStartMs) / 1000.0) + "s)";
+                        }
+                    } else {
+                        // activeCode == -1: check if this is a rapid repeat pulse or short->long keycode handoff
+                        long sinceRelease = nowMs - lastReleaseMs;
+                        long prevHoldDur = lastReleaseMs - holdStartMs;
+                        boolean isRapidRepeat = (holdStartMs > 0L && code == lastReleasedCode && sinceRelease >= 0L && sinceRelease <= 550L);
+                        boolean isShortToLongHandoff = (holdStartMs > 0L && code != lastReleasedCode
+                                && ((prevHoldDur >= 700L && sinceRelease <= 600L)
+                                || (knownMapLongCodes.contains(code) && (nowMs - holdStartMs) >= 1200L && (nowMs - holdStartMs) <= 4000L)));
+
+                        if (isRapidRepeat || isShortToLongHandoff) {
+                            activeCode = code;
+                            activeDevName = devName;
+                            lastEventMs = nowMs;
+                            pulseCount++;
+                            if (!holdTriggered && (nowMs - holdStartMs) >= HOLD_DURATION_MS) {
+                                holdTriggered = true;
+                                triggerNow = true;
+                                triggerDetail = "EV_KEY hold-chain code=" + code + " (" + ((nowMs - holdStartMs) / 1000.0) + "s)";
+                            }
+                        } else {
+                            // Fresh MAP button press
+                            activeDevName = devName;
+                            activeCode = code;
+                            holdStartMs = nowMs;
+                            lastEventMs = nowMs;
+                            pulseCount = 1;
+                            holdTriggered = false;
+                        }
+                    }
+                } else if (value == 2) { // KEY_REPEAT
+                    if (activeCode == code && holdStartMs > 0L) {
+                        lastEventMs = nowMs;
+                        if (!holdTriggered && (nowMs - holdStartMs) >= HOLD_DURATION_MS) {
+                            holdTriggered = true;
+                            triggerNow = true;
+                            triggerDetail = "EV_KEY repeat code=" + code + " (" + ((nowMs - holdStartMs) / 1000.0) + "s)";
+                        }
+                    }
+                } else if (value == 0) { // KEY_UP
+                    if (activeCode == code) {
+                        if (!holdTriggered && holdStartMs > 0L && (nowMs - holdStartMs) >= HOLD_DURATION_MS) {
+                            holdTriggered = true;
+                            triggerNow = true;
+                            triggerDetail = "EV_KEY release after " + ((nowMs - holdStartMs) / 1000.0) + "s (code=" + code + ")";
+                        }
+                        lastReleaseMs = nowMs;
+                        lastReleasedCode = code;
+                        activeCode = -1;
+                    }
+                }
+            }
+
+            if (triggerNow) {
+                fireDashboardTrigger(triggerDetail, nowMs, isSelfTest);
+            }
+            return triggerNow;
+        }
+
+        /**
+         * Periodic 100ms timer check so that holding the MAP button immediately pops up the Dashboard
+         * right as the hold reaches 3.0 seconds, without waiting for the user to release the button.
+         */
+        public static boolean checkPeriodicHoldTimer(long nowMs, boolean isSelfTest) {
+            boolean triggerNow = false;
+            String triggerDetail = "";
+            synchronized (STATE_LOCK) {
+                if (!holdTriggered && holdStartMs > 0L) {
+                    long elapsed = nowMs - holdStartMs;
+                    if (activeCode != -1 && elapsed >= HOLD_DURATION_MS) {
+                        holdTriggered = true;
+                        triggerNow = true;
+                        triggerDetail = String.format(Locale.US, "MAP code=%d %.1f초 유지", activeCode, elapsed / 1000.0);
+                    } else if (activeCode == -1 && pulseCount >= 4 && (nowMs - lastReleaseMs) <= 450L && elapsed >= HOLD_DURATION_MS) {
+                        holdTriggered = true;
+                        triggerNow = true;
+                        triggerDetail = String.format(Locale.US, "MAP pulse code=%d %.1f초 유지", lastReleasedCode, elapsed / 1000.0);
+                    }
+                }
+            }
+            if (triggerNow) {
+                fireDashboardTrigger(triggerDetail, nowMs, isSelfTest);
+            }
+            return triggerNow;
+        }
+
+        private static void fireDashboardTrigger(String detail, long nowMs, boolean isSelfTest) {
+            if (isSelfTest) {
+                selfTestTriggerCount++;
+                return;
+            }
+            synchronized (STATE_LOCK) {
+                if (nowMs - lastPopupTriggerMs < 3500L) {
+                    return; // Debounce duplicate triggers within 3.5s
+                }
+                lastPopupTriggerMs = nowMs;
+            }
+            String logMsg = "[MapKeyMonitor] TRIGGERED Dashboard Popup! (" + detail + ")";
+            System.out.println(logMsg);
+            appendKeyLog(logMsg);
+            try {
+                File tmpDir = new File(TMP_DIR_PATH);
+                if (!tmpDir.exists()) tmpDir.mkdirs();
+                StatusDashboardOverlay.showFromMapLongPress(detail);
+            } catch (Throwable t) {
+                appendKeyLog("[MapKeyMonitor] showFromMapLongPress error: " + t);
+            }
+        }
+
+        public static void start(final String installDir) {
+            if (started) return;
+            started = true;
+            sInstallDir = installDir;
+
+            loadSystemKeyLayouts(installDir);
+
+            // 1. Periodic 100ms hold-timer & input device hot-discovery thread
+            Thread timerThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    long lastScanMs = 0L;
+                    while (true) {
+                        try {
+                            long now = System.currentTimeMillis();
+                            if (now - lastScanMs >= 5000L) {
+                                lastScanMs = now;
+                                scanAndAttachInputDevices();
+                            }
+                            checkPeriodicHoldTimer(now, false);
+                            Thread.sleep(100L);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            }, "UsbWifiMapHoldTimer");
+            timerThread.setDaemon(true);
+            timerThread.start();
+
+            // 2. Companion logcat key monitor for ModeManagerService / PhoneWindowManager / WindowManager
+            Thread logcatThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    runLogcatKeyMonitor();
+                }
+            }, "UsbWifiMapLogcatMonitor");
+            logcatThread.setDaemon(true);
+            logcatThread.start();
+        }
+
+        private static void scanAndAttachInputDevices() {
+            File inputDir = new File("/dev/input");
+            File[] files = inputDir.listFiles();
+            if (files == null) return;
+            for (File devFile : files) {
+                String fname = devFile.getName();
+                if (!fname.startsWith("event")) continue;
+                final String absPath = devFile.getAbsolutePath();
+                synchronized (STATE_LOCK) {
+                    if (activeReaderPaths.contains(absPath)) continue;
+                }
+                String sysNamePath = "/sys/class/input/" + fname + "/device/name";
+                String devName = readFirstLineQuick(new File(sysNamePath));
+                String lowName = devName.toLowerCase(Locale.US);
+
+                // Skip touchscreens and rotary knobs
+                if (lowName.contains("touch") || lowName.contains("fts_ts") || lowName.contains("siw_")
+                        || lowName.contains("melfas") || lowName.contains("mip4") || lowName.contains("atmel")
+                        || lowName.contains("mxt") || lowName.contains("knob")) {
+                    synchronized (STATE_LOCK) {
+                        activeReaderPaths.add(absPath);
+                    }
+                    appendKeyLog("[InputSkip] " + fname + " (" + devName + ") -> skipped (touch/knob)");
+                    continue;
+                }
+
+                final boolean isFascia = (lowName.contains("daudio") && !lowName.contains("_can") && !lowName.contains("_knob"))
+                        || lowName.contains("keypad")
+                        || lowName.contains("gpio-keys")
+                        || "event0".equals(fname)
+                        || "event1".equals(fname);
+                final String label = devName.isEmpty() ? fname : (fname + ":" + devName);
+
+                synchronized (STATE_LOCK) {
+                    activeReaderPaths.add(absPath);
+                }
+                appendKeyLog("[InputAttach] Monitoring " + absPath + " name='" + devName + "' isFascia=" + isFascia);
+
+                Thread reader = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        readInputEventLoop(devFile, label, isFascia);
+                    }
+                }, "InputReader-" + fname);
+                reader.setDaemon(true);
+                reader.start();
+            }
+        }
+
+        private static void readInputEventLoop(File devFile, String label, boolean isFascia) {
+            FileInputStream fis = null;
+            byte[] buf = new byte[16];
+            try {
+                fis = new FileInputStream(devFile);
+                while (true) {
+                    int off = 0;
+                    while (off < 16) {
+                        int n = fis.read(buf, off, 16 - off);
+                        if (n < 0) {
+                            throw new IOException("EOF on " + devFile.getAbsolutePath());
+                        }
+                        off += n;
+                    }
+                    int type = (buf[8] & 0xFF) | ((buf[9] & 0xFF) << 8);
+                    int code = (buf[10] & 0xFF) | ((buf[11] & 0xFF) << 8);
+                    int value = (buf[12] & 0xFF)
+                            | ((buf[13] & 0xFF) << 8)
+                            | ((buf[14] & 0xFF) << 16)
+                            | ((buf[15] & 0xFF) << 24);
+
+                    if (type == 1) { // EV_KEY
+                        long now = System.currentTimeMillis();
+                        String klName;
+                        synchronized (STATE_LOCK) {
+                            klName = codeToKlName.containsKey(code) ? codeToKlName.get(code) : "UNKNOWN";
+                        }
+                        String navifg = getSystemProperty("persist.sys.hkmc.navifg", "");
+                        appendKeyLog("EV_KEY dev=" + label + " code=" + code + "(0x" + Integer.toHexString(code)
+                                + ") val=" + value + " kl=" + klName + " navifg=" + navifg);
+                        onKeyEvent(label, isFascia, code, value, now, false);
+                    }
+                }
+            } catch (Throwable t) {
+                appendKeyLog("[InputReaderExit] " + label + ": " + t);
+            } finally {
+                if (fis != null) try { fis.close(); } catch (Exception ignored) {}
+                synchronized (STATE_LOCK) {
+                    activeReaderPaths.remove(devFile.getAbsolutePath());
+                }
+            }
+        }
+
+        private static void runLogcatKeyMonitor() {
+            while (true) {
+                Process proc = null;
+                BufferedReader br = null;
+                try {
+                    long startMs = System.currentTimeMillis();
+                    proc = new ProcessBuilder(
+                            "/system/bin/logcat", "-v", "time", "-b", "main",
+                            "ModeManagerService:V", "PhoneWindowManager:D", "WindowManager:D", "InputReader:D", "*:S"
+                    ).redirectErrorStream(true).start();
+                    br = new BufferedReader(new InputStreamReader(proc.getInputStream(), UTF8));
+                    String line;
+                    long logMapDownMs = 0L;
+                    boolean logMapTriggered = false;
+                    while ((line = br.readLine()) != null) {
+                        long now = System.currentTimeMillis();
+                        // Skip historical logcat buffer during the first 2.0 seconds after attaching
+                        if (now - startMs < 2000L) continue;
+                        String up = line.toUpperCase(Locale.US);
+                        if (!up.contains("MAP") && !up.contains("KEYCODE") && !up.contains("HARDKEY")) {
+                            continue;
+                        }
+                        if (up.contains("NAVI_GPS_CHANGED") || up.contains("MAPMATCHING")) {
+                            continue;
+                        }
+                        appendKeyLog("[LogcatKey] " + line.trim());
+
+                        if (up.contains("MAP")) {
+                            boolean isUp = up.contains("ACTION_UP") || up.contains("KEY_UP") || up.contains("UP=TRUE") || up.contains("RELEASE");
+                            boolean isDown = up.contains("ACTION_DOWN") || up.contains("KEY_DOWN") || up.contains("DOWN=TRUE") || up.contains("PRESS");
+                            boolean isLong = up.contains("LONG");
+
+                            if (isUp) {
+                                if (logMapDownMs > 0L && !logMapTriggered && (now - logMapDownMs) >= HOLD_DURATION_MS) {
+                                    logMapTriggered = true;
+                                    fireDashboardTrigger("Logcat MAP hold " + ((now - logMapDownMs) / 1000.0) + "s", now, false);
+                                }
+                                logMapDownMs = 0L;
+                                logMapTriggered = false;
+                            } else if (isLong) {
+                                if (!logMapTriggered && (logMapDownMs == 0L || (now - logMapDownMs) >= 2400L)) {
+                                    logMapTriggered = true;
+                                    fireDashboardTrigger("Logcat MAP_LONG", now, false);
+                                }
+                            } else if (isDown) {
+                                if (logMapDownMs == 0L) {
+                                    logMapDownMs = now;
+                                    logMapTriggered = false;
+                                } else if (!logMapTriggered && (now - logMapDownMs) >= HOLD_DURATION_MS) {
+                                    logMapTriggered = true;
+                                    fireDashboardTrigger("Logcat MAP repeat " + ((now - logMapDownMs) / 1000.0) + "s", now, false);
+                                }
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    if (br != null) try { br.close(); } catch (Exception ignored) {}
+                    if (proc != null) try { proc.destroy(); } catch (Exception ignored) {}
+                }
+                try {
+                    Thread.sleep(5000L);
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+
+        private static void appendKeyLog(String msg) {
+            FileOutputStream fos = null;
+            try {
+                File tmpDir = new File(TMP_DIR_PATH);
+                if (!tmpDir.exists()) return;
+                File logFile = new File(tmpDir, "key_events.log");
+                if (logFile.isFile() && logFile.length() > 65536L) {
+                    File bak = new File(tmpDir, "key_events.old.log");
+                    if (bak.exists()) bak.delete();
+                    logFile.renameTo(bak);
+                }
+                String ts = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date());
+                byte[] lineBytes = (ts + " " + msg + "\n").getBytes(UTF8);
+                fos = new FileOutputStream(logFile, true);
+                fos.write(lineBytes);
+            } catch (Throwable ignored) {
+            } finally {
+                if (fos != null) try { fos.close(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
     public static int runSelfTest() throws Exception {
         String compact = compactLogLine("Sat Oct 31 14:13:50 +09:00 2026 Service started (pid=3563), monitoring USB 0bda:b812");
         if (!compact.startsWith("14:13:50 Service started")) {
@@ -3778,11 +4391,66 @@ public class UsbWifiStatusMain {
         if (!sha256Hex(testPayload).equals(sha256Hex(decoded))) {
             throw new AssertionError("Base64/SHA-256 self-test failed");
         }
-        Map<String, String> jmap = parseJsonFlatMap("{\"version\": \"1.8.0\", \"sha256_jar\": \"abcd\"}");
-        if (!"1.8.0".equals(jmap.get("version")) || !"abcd".equals(jmap.get("sha256_jar"))) {
+        Map<String, String> jmap = parseJsonFlatMap("{\"version\": \"1.9.0\", \"sha256_jar\": \"abcd\"}");
+        if (!"1.9.0".equals(jmap.get("version")) || !"abcd".equals(jmap.get("sha256_jar"))) {
             throw new AssertionError("parseJsonFlatMap failed");
         }
-        System.out.println("USBWIFI STATUS UI SELF-TEST PASSED! (" + compact + ")");
+
+        // Self-test MapButtonLongPressMonitor (3.0-second MAP button hold detector)
+        MapButtonLongPressMonitor.resetForSelfTest();
+        List<String> mockKl = new ArrayList<String>();
+        mockKl.add("key 214 HKMC_MAP");
+        mockKl.add("key 215 HKMC_MAP_LONG");
+        mockKl.add("key 216 HKMC_NAVI");
+        mockKl.add("key 115 VOLUME_UP");
+        mockKl.add("key 163 MEDIA_NEXT");
+        MapButtonLongPressMonitor.parseKeyLayoutLines("daudio_wp_daudioplus_cvev_kr.kl", mockKl, true);
+
+        // 1) Short press of MAP (250ms) -> must NOT trigger
+        MapButtonLongPressMonitor.onKeyEvent("event1", true, 214, 1, 1000L, true);
+        MapButtonLongPressMonitor.checkPeriodicHoldTimer(1200L, true);
+        MapButtonLongPressMonitor.onKeyEvent("event1", true, 214, 0, 1250L, true);
+        if (MapButtonLongPressMonitor.selfTestTriggerCount != 0) {
+            throw new AssertionError("Short MAP press must not trigger dashboard");
+        }
+
+        // 2) Long press of non-MAP key (VOLUME_UP 115 or NAVI 216 held for 3500ms) -> must NOT trigger
+        MapButtonLongPressMonitor.onKeyEvent("event1", true, 115, 1, 2000L, true);
+        MapButtonLongPressMonitor.checkPeriodicHoldTimer(5500L, true);
+        MapButtonLongPressMonitor.onKeyEvent("event1", true, 115, 0, 5600L, true);
+        MapButtonLongPressMonitor.onKeyEvent("event1", true, 216, 1, 6000L, true);
+        MapButtonLongPressMonitor.checkPeriodicHoldTimer(9500L, true);
+        MapButtonLongPressMonitor.onKeyEvent("event1", true, 216, 0, 9600L, true);
+        if (MapButtonLongPressMonitor.selfTestTriggerCount != 0) {
+            throw new AssertionError("Non-MAP key hold must not trigger dashboard");
+        }
+
+        // 3) Continuous 3.0-second hold of MAP (code 214 held for 3000ms) -> MUST trigger right at 3000ms
+        MapButtonLongPressMonitor.onKeyEvent("event1", true, 214, 1, 10000L, true);
+        MapButtonLongPressMonitor.checkPeriodicHoldTimer(12900L, true);
+        if (MapButtonLongPressMonitor.selfTestTriggerCount != 0) {
+            throw new AssertionError("MAP hold at 2.9s must not trigger yet");
+        }
+        MapButtonLongPressMonitor.checkPeriodicHoldTimer(13000L, true);
+        if (MapButtonLongPressMonitor.selfTestTriggerCount != 1) {
+            throw new AssertionError("MAP hold at 3.0s must trigger dashboard");
+        }
+        MapButtonLongPressMonitor.onKeyEvent("event1", true, 214, 0, 13500L, true);
+        if (MapButtonLongPressMonitor.selfTestTriggerCount != 1) {
+            throw new AssertionError("MAP release after trigger must not double-trigger");
+        }
+
+        // 4) Short-to-long keycode handoff (214 held 1.5s -> 215 held 1.5s = 3.0s total) -> MUST trigger
+        MapButtonLongPressMonitor.onKeyEvent("event1", true, 214, 1, 20000L, true);
+        MapButtonLongPressMonitor.onKeyEvent("event1", true, 214, 0, 21500L, true);
+        MapButtonLongPressMonitor.onKeyEvent("event1", true, 215, 1, 21550L, true);
+        MapButtonLongPressMonitor.checkPeriodicHoldTimer(23000L, true);
+        MapButtonLongPressMonitor.onKeyEvent("event1", true, 215, 0, 23100L, true);
+        if (MapButtonLongPressMonitor.selfTestTriggerCount != 2) {
+            throw new AssertionError("MAP short-to-long handoff at 3.0s must trigger dashboard");
+        }
+
+        System.out.println("USBWIFI STATUS UI SELF-TEST PASSED! (" + compact + ", mapHoldTests=OK)");
         return 0;
     }
 

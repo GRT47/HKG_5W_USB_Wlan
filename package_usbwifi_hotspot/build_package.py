@@ -187,6 +187,9 @@ def build() -> None:
         "\n"
         "# GitHub OTA Auto-Update: 1 = automatically check & install updates from GRT47/HKG_5W_USB_Wlan, 0 = manual only\n"
         "AUTO_UPDATE=1\n"
+        "\n"
+        "# Physical [MAP] button 3-second long-press Dashboard popup keycode (AUTO = detect via .kl / fascia input)\n"
+        "MAP_KEY_CODE=AUTO\n"
     )
 
     # 3. Post-install script (scripts/post.sh)
@@ -1242,13 +1245,13 @@ def build() -> None:
 
     version_manifest = json.dumps(
         {
-            "version": "1.8.0",
+            "version": "1.9.0",
             "repo": "GRT47/HKG_5W_USB_Wlan",
             "branch": "main",
             "sha256_jar": sha256_jar,
             "sha256_daemon": sha256_daemon,
             "sha256_launch": sha256_launch,
-            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode with GitHub OTA Auto-Update",
+            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode with MAP 3s Long-Press & GitHub OTA",
         },
         indent=2,
         ensure_ascii=False,
