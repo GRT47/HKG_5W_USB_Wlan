@@ -403,6 +403,32 @@ public class UsbWifiStatusMain {
                 snap.staBand = freq >= 4900 ? "5GHz" : "2.4GHz";
             }
         }
+        if (!snap.staConnected) {
+            File[] apInfoFiles = new File[]{
+                    !snap.usbIface.isEmpty() ? new File("/proc/net/rtl88x2bu/" + snap.usbIface + "/ap_info") : new File(tmpDir, "sta_ap_info.txt"),
+                    new File(tmpDir, "sta_ap_info.txt")
+            };
+            for (File aif : apInfoFiles) {
+                if (!aif.isFile()) continue;
+                List<String> alines = readLinesQuick(aif, 20);
+                for (String al : alines) {
+                    String t = al.trim();
+                    if (t.startsWith("SSID=")) {
+                        String val = t.substring(5).trim();
+                        if (!val.isEmpty() && !"(null)".equalsIgnoreCase(val)) {
+                            snap.staConnected = true;
+                            snap.staConnectedSsid = val;
+                        }
+                    } else if (t.startsWith("cur_channel=")) {
+                        int comma = t.indexOf(',');
+                        String chStr = (comma > 12 ? t.substring(12, comma) : t.substring(12)).trim();
+                        int ch = (int) parseLongSafe(chStr, 1L);
+                        snap.staBand = ch >= 36 ? "5GHz" : "2.4GHz";
+                    }
+                }
+                if (snap.staConnected) break;
+            }
+        }
         File wpaSigFile = new File(tmpDir, "wpa_signal.txt");
         if (wpaSigFile.isFile()) {
             Map<String, String> wsig = parseKeyValueFile(wpaSigFile);
@@ -411,10 +437,34 @@ public class UsbWifiStatusMain {
                 snap.staRssi = rssiVal + " dBm";
             }
         }
+        if ("-- dBm".equals(snap.staRssi)) {
+            File[] rxSigFiles = new File[]{
+                    !snap.usbIface.isEmpty() ? new File("/proc/net/rtl88x2bu/" + snap.usbIface + "/rx_signal") : new File(tmpDir, "sta_rx_signal.txt"),
+                    new File(tmpDir, "sta_rx_signal.txt")
+            };
+            for (File rxf : rxSigFiles) {
+                if (!rxf.isFile()) continue;
+                List<String> rlines = readLinesQuick(rxf, 10);
+                for (String rl : rlines) {
+                    String t = rl.trim();
+                    if (t.startsWith("rssi:")) {
+                        long rv = parseLongSafe(t.substring(5).trim(), 0L);
+                        if (rv < 0L) {
+                            snap.staRssi = rv + " dBm";
+                            break;
+                        } else if (rv > 0L) {
+                            snap.staRssi = (rv - 100L) + " dBm";
+                            break;
+                        }
+                    }
+                }
+                if (!"-- dBm".equals(snap.staRssi)) break;
+            }
+        }
+        Map<String, ScanEntry> dedup = new LinkedHashMap<String, ScanEntry>();
         File scanFile = new File(tmpDir, "sta_scan.txt");
         if (scanFile.isFile()) {
             List<String> scanLines = readLinesQuick(scanFile, 80);
-            Map<String, ScanEntry> dedup = new LinkedHashMap<String, ScanEntry>();
             for (String sl : scanLines) {
                 String t = sl.trim();
                 if (t.isEmpty() || t.startsWith("Selected interface") || t.startsWith("bssid")) continue;
@@ -439,8 +489,38 @@ public class UsbWifiStatusMain {
                     }
                 }
             }
-            snap.staScanList.addAll(dedup.values());
         }
+        File[] surveyFiles = new File[]{
+                !snap.usbIface.isEmpty() ? new File("/proc/net/rtl88x2bu/" + snap.usbIface + "/survey_info") : new File(tmpDir, "sta_survey.txt"),
+                new File(tmpDir, "sta_survey.txt")
+        };
+        for (File svf : surveyFiles) {
+            if (!svf.isFile()) continue;
+            List<String> svLines = readLinesQuick(svf, 80);
+            for (String sl : svLines) {
+                String t = sl.trim();
+                if (t.isEmpty() || t.startsWith("index")) continue;
+                String[] cols = t.split("\\s+", 9);
+                if (cols.length >= 9 && cols[1].indexOf(':') > 0) {
+                    int ch = (int) parseLongSafe(cols[2], 1L);
+                    int sdbm = (int) parseLongSafe(cols[4], -75L);
+                    String flags = cols[7];
+                    String ssid = cols[8].trim();
+                    if (ssid.isEmpty() || ssid.startsWith("\\x00")) continue;
+                    ScanEntry existing = dedup.get(ssid);
+                    if (existing == null || sdbm > existing.rssi) {
+                        ScanEntry se = new ScanEntry();
+                        se.ssid = ssid;
+                        se.band = ch >= 36 ? "5G" : "2.4G";
+                        se.rssi = sdbm;
+                        se.secured = flags.contains("WPA") || flags.contains("WEP") || flags.contains("RSN");
+                        dedup.put(ssid, se);
+                    }
+                }
+            }
+            if (!dedup.isEmpty()) break;
+        }
+        snap.staScanList.addAll(dedup.values());
         File savedStaFile = new File(installDir, "config/saved_sta.conf");
         if (savedStaFile.isFile()) {
             List<String> slines = readLinesQuick(savedStaFile, 20);
