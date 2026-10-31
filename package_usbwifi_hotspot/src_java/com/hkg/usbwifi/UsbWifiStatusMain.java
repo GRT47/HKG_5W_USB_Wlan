@@ -42,11 +42,18 @@ import java.util.Map;
  */
 public class UsbWifiStatusMain {
 
-    public static final String UI_VERSION = "1.6.0";
+    public static final String UI_VERSION = "1.7.0";
     private static final Charset UTF8 = Charset.forName("UTF-8");
 
     private static final String TMP_DIR_PATH = "/data/local/tmp/usbwifi_hotspot";
     private static final String WIFI_WORK_DIR_PATH = "/data/misc/wifi/usbwifi_hotspot";
+
+    public static final class ScanEntry {
+        public String ssid = "";
+        public String band = "2.4G";
+        public int rssi = -70;
+        public boolean secured = true;
+    }
 
     public static final class SystemSnapshot {
         public String platform = "";
@@ -78,6 +85,7 @@ public class UsbWifiStatusMain {
         public boolean builtinWlan0Up = false;
         public String builtinWlan0Ip = "";
 
+        public String wifiMode = "ap";
         public boolean hostapdAlive = false;
         public String hostapdPid = "";
         public boolean dnsmasqAlive = false;
@@ -90,6 +98,17 @@ public class UsbWifiStatusMain {
         public String apChannel = "6";
         public String forceSubnet = "AUTO";
         public String enableLteNat = "1";
+
+        public String staSsid = "";
+        public String staPass = "";
+        public boolean wpaSuppAlive = false;
+        public String wpaSuppPid = "";
+        public boolean staConnected = false;
+        public String staConnectedSsid = "";
+        public String staBand = "2.4GHz";
+        public String staRssi = "-50 dBm";
+        public List<ScanEntry> staScanList = new ArrayList<ScanEntry>();
+        public List<String> savedStaList = new ArrayList<String>();
 
         public int cpuLoadPct = 0;
         public String ramSummary = "💾 RAM: --";
@@ -112,10 +131,16 @@ public class UsbWifiStatusMain {
         Map<String, String> conf = parseKeyValueFile(confFile);
         String targetVid = normalizeLower(conf.get("USB_VID"), "0bda");
         String targetPid = normalizeLower(conf.get("USB_PID"), "b812");
+        snap.wifiMode = normalizeLower(conf.get("WIFI_MODE"), "ap");
+        if (!"sta".equals(snap.wifiMode)) {
+            snap.wifiMode = "ap";
+        }
         snap.apSsid = stripQuotes( getOrDefault(conf, "AP_SSID", "HKG_USB_Hotspot") );
         snap.apPass = stripQuotes( getOrDefault(conf, "AP_PASS", "12345678") );
         snap.apHwMode = stripQuotes( getOrDefault(conf, "AP_HW_MODE", "g") );
         snap.apChannel = stripQuotes( getOrDefault(conf, "AP_CHANNEL", "6") );
+        snap.staSsid = stripQuotes( getOrDefault(conf, "STA_SSID", "") );
+        snap.staPass = stripQuotes( getOrDefault(conf, "STA_PASS", "") );
         snap.forceSubnet = stripQuotes( getOrDefault(conf, "FORCE_SUBNET", "AUTO") );
         snap.enableLteNat = stripQuotes( getOrDefault(conf, "ENABLE_LTE_NAT", "1") );
 
@@ -358,18 +383,98 @@ public class UsbWifiStatusMain {
         }
         snap.connectedClients.addAll(clientMap.values());
 
+        // 6b. Client (STA) Mode status, scan results & saved Wi-Fi networks
+        File wpidFile = new File(tmpDir, "wpa_supplicant.pid");
+        if (wpidFile.isFile()) {
+            String wpid = readFirstLineQuick(wpidFile);
+            if (isProcessAlive(wpid)) {
+                snap.wpaSuppAlive = true;
+                snap.wpaSuppPid = wpid;
+            }
+        }
+        File wpaStatusFile = new File(tmpDir, "wpa_status.txt");
+        if (wpaStatusFile.isFile()) {
+            Map<String, String> wstat = parseKeyValueFile(wpaStatusFile);
+            String wstate = getOrDefault(wstat, "wpa_state", "");
+            if ("COMPLETED".equalsIgnoreCase(wstate)) {
+                snap.staConnected = true;
+                snap.staConnectedSsid = getOrDefault(wstat, "ssid", snap.staSsid);
+                int freq = (int) parseLongSafe(wstat.get("freq"), 2412L);
+                snap.staBand = freq >= 4900 ? "5GHz" : "2.4GHz";
+            }
+        }
+        File wpaSigFile = new File(tmpDir, "wpa_signal.txt");
+        if (wpaSigFile.isFile()) {
+            Map<String, String> wsig = parseKeyValueFile(wpaSigFile);
+            String rssiVal = wsig.get("RSSI");
+            if (rssiVal != null && !rssiVal.isEmpty()) {
+                snap.staRssi = rssiVal + " dBm";
+            }
+        }
+        File scanFile = new File(tmpDir, "sta_scan.txt");
+        if (scanFile.isFile()) {
+            List<String> scanLines = readLinesQuick(scanFile, 80);
+            Map<String, ScanEntry> dedup = new LinkedHashMap<String, ScanEntry>();
+            for (String sl : scanLines) {
+                String t = sl.trim();
+                if (t.isEmpty() || t.startsWith("Selected interface") || t.startsWith("bssid")) continue;
+                String[] cols = t.split("\\t+");
+                if (cols.length < 5) {
+                    cols = t.split("\\s+", 5);
+                }
+                if (cols.length >= 5) {
+                    int freq = (int) parseLongSafe(cols[1], 2412L);
+                    int rssi = (int) parseLongSafe(cols[2], -75L);
+                    String flags = cols[3];
+                    String ssid = cols[4].trim();
+                    if (ssid.isEmpty() || ssid.startsWith("\\x00")) continue;
+                    ScanEntry existing = dedup.get(ssid);
+                    if (existing == null || rssi > existing.rssi) {
+                        ScanEntry se = new ScanEntry();
+                        se.ssid = ssid;
+                        se.band = freq >= 4900 ? "5G" : "2.4G";
+                        se.rssi = rssi;
+                        se.secured = flags.contains("WPA") || flags.contains("WEP") || flags.contains("RSN");
+                        dedup.put(ssid, se);
+                    }
+                }
+            }
+            snap.staScanList.addAll(dedup.values());
+        }
+        File savedStaFile = new File(installDir, "config/saved_sta.conf");
+        if (savedStaFile.isFile()) {
+            List<String> slines = readLinesQuick(savedStaFile, 20);
+            for (String sl : slines) {
+                int eq = sl.indexOf('=');
+                String sName = (eq > 0 ? sl.substring(0, eq) : sl).trim();
+                if (!sName.isEmpty() && !snap.savedStaList.contains(sName)) {
+                    snap.savedStaList.add(sName);
+                }
+            }
+        }
+        if (!snap.staSsid.isEmpty() && !snap.savedStaList.contains(snap.staSsid)) {
+            snap.savedStaList.add(0, snap.staSsid);
+        }
+
         // 7. CPU & RAM usage
         snap.cpuLoadPct = StatusDashboardOverlay.sampleCpuUsagePercent();
         snap.ramSummary = StatusDashboardOverlay.readRamUsageSummary();
 
-        // 8. Recent logs from daemon.log & hostapd.log
+        // 8. Recent logs from daemon.log & hostapd.log / wpa_supplicant.log
         List<String> dLogs = readTailLines(new File(tmpDir, "daemon.log"), 4);
         for (String dl : dLogs) {
             snap.recentLogs.add("[데몬] " + compactLogLine(dl));
         }
-        List<String> hLogs = readTailLines(new File(tmpDir, "hostapd.log"), 3);
-        for (String hl : hLogs) {
-            snap.recentLogs.add("[AP] " + compactLogLine(hl));
+        if ("sta".equals(snap.wifiMode)) {
+            List<String> wLogs = readTailLines(new File(tmpDir, "wpa_supplicant.log"), 3);
+            for (String wl : wLogs) {
+                snap.recentLogs.add("[STA] " + compactLogLine(wl));
+            }
+        } else {
+            List<String> hLogs = readTailLines(new File(tmpDir, "hostapd.log"), 3);
+            for (String hl : hLogs) {
+                snap.recentLogs.add("[AP] " + compactLogLine(hl));
+            }
         }
         if (snap.recentLogs.isEmpty()) {
             snap.recentLogs.add("(아직 기록된 로그가 없습니다)");
@@ -547,13 +652,79 @@ public class UsbWifiStatusMain {
         private static volatile Object windowManager = null;
         private static volatile Object sysContext = null;
         private static volatile Object rootOverlayView = null;
+
+        private static volatile Object mainScreenBox = null;
+        private static volatile Object editModalBox = null;
+
+        private static volatile Object tabModeApBtn = null;
+        private static volatile Object tabModeStaBtn = null;
+        private static volatile Object statusPillTv = null;
+        private static volatile Object expertToggleBtn = null;
+
+        private static volatile Object apViewBox = null;
+        private static volatile Object staViewBox = null;
+        private static volatile Object expertViewBox = null;
+
+        // AP Mode Views
+        private static volatile Object apSsidTv = null;
+        private static volatile Object apSsidHintTv = null;
+        private static volatile Object apBandDescTv = null;
+        private static volatile Object band24Btn = null;
+        private static volatile Object band5Btn = null;
+        private static volatile Object pwMaskToggleBtn = null;
+        private static volatile Object apPassTv = null;
+        private static volatile Object apClientCountBadgeTv = null;
+        private static volatile Object apClientListTv = null;
+        private static volatile Object apTrafficTv = null;
+
+        // STA (Client) Mode Views
+        private static volatile Object staConnBadgeTv = null;
+        private static volatile Object staConnectedSsidTv = null;
+        private static volatile Object staConnectedDetailTv = null;
+        private static final Object[] staScanRowViews = new Object[4];
+        private static final Object[] staScanRowTitleTvs = new Object[4];
+        private static final Object[] staScanRowSubTvs = new Object[4];
+        private static final Object[] staScanRowBandTvs = new Object[4];
+        private static final String[] staScanRowSsids = new String[]{"", "", "", ""};
+        private static volatile Object staSavedListTv = null;
+        private static volatile Object staTrafficTv = null;
+
+        // Expert Mode Views
         private static volatile Object headerSysInfoTextView = null;
         private static volatile Object leftColTextView = null;
         private static volatile Object rightColTextView = null;
+        private static volatile Object subnetCycleBtn = null;
+
+        // Footer Views
         private static volatile Object footerStatusTextView = null;
+        private static volatile Object footerTimerTextView = null;
+
+        // Touch Keyboard Modal Views & State
+        private static volatile boolean isEditModalOpen = false;
+        private static volatile String modalContext = "ap"; // "ap" or "sta"
+        private static volatile String activeEditField = "ssid"; // "ssid" or "pass"
+        private static volatile String editingSsid = "HKG_USB_Hotspot";
+        private static volatile String editingPass = "12345678";
+        private static volatile boolean kbUpper = true;
+        private static volatile Object modalTitleTv = null;
+        private static volatile Object modalValidationTv = null;
+        private static volatile Object modalSaveBtn = null;
+        private static volatile Object modalSsidFieldBox = null;
+        private static volatile Object modalPassFieldBox = null;
+        private static volatile Object modalSsidLenTv = null;
+        private static volatile Object modalPassLenTv = null;
+        private static volatile Object modalSsidValueTv = null;
+        private static volatile Object modalPassValueTv = null;
+        private static volatile Object kbShiftBtn = null;
+        private static final List<Object> kbLetterBtns = new ArrayList<Object>();
+        private static final List<String> kbLetterBaseChars = new ArrayList<String>();
+
+        // UI State
         private static volatile boolean isVisible = false;
+        private static volatile boolean isExpertView = false;
+        private static volatile boolean isPwMasked = false;
         private static volatile long shownAtMs = 0L;
-        private static volatile String actionBannerMsg = "실시간 1초 주기 자동 갱신 중 | 90초 후 자동 닫힘";
+        private static volatile String actionBannerMsg = "💡 상단 좌측 스위치로 [📡 핫스팟 모드]와 [📶 와이파이 수신 모드]를 언제든 전환할 수 있습니다.";
         private static volatile long lastCpuTotalTicks = 0L;
         private static volatile long lastCpuIdleTicks = 0L;
         private static volatile int lastCpuLoadPct = 0;
@@ -712,7 +883,7 @@ public class UsbWifiStatusMain {
             }
         }
 
-        private static Object[] buildDashboardViewTree() throws Exception {
+        private static Object buildDashboardViewTree() throws Exception {
             Class<?> ctxCls = Class.forName("android.content.Context");
             Class<?> viewCls = Class.forName("android.view.View");
             Class<?> vgCls = Class.forName("android.view.ViewGroup");
@@ -726,181 +897,957 @@ public class UsbWifiStatusMain {
             Constructor<?> llLpCtor2 = llLpCls.getConstructor(int.class, int.class);
             Constructor<?> llLpCtor3 = llLpCls.getConstructor(int.class, int.class, float.class);
             Method tvSetGravity = tvCls.getMethod("setGravity", int.class);
+            Method setVis = viewCls.getMethod("setVisibility", int.class);
+            Method setPad = viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class);
+            Method addView = vgCls.getMethod("addView", viewCls, vgLpCls);
+            Method setOrient = llCls.getMethod("setOrientation", int.class);
+            Method llSetGrav = llCls.getMethod("setGravity", int.class);
 
             final int MATCH_PARENT = -1;
             final int WRAP_CONTENT = -2;
 
-            // Root container
+            kbLetterBtns.clear();
+            kbLetterBaseChars.clear();
+
+            // Full-Screen Root Container (8:3 wide aspect ratio navigation screen)
             Object root = llCtor.newInstance(sysContext);
-            llCls.getMethod("setOrientation", int.class).invoke(root, 1); // VERTICAL
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(root, 26, 20, 26, 20);
-            setRoundedBg(root, 0xF20F172A, 0xFF38BDF8, 3, 18f);
+            setOrient.invoke(root, 1); // VERTICAL
+            setPad.invoke(root, 24, 14, 24, 14);
+            setRoundedBg(root, 0xFF0B1120, 0xFF1E293B, 1, 0f);
             disableViewEffects(root, true);
 
-            // 1. Header Row
+            // =====================================================================
+            // MAIN SCREEN CONTAINER (Header + 3-Col Body + Footer)
+            // =====================================================================
+            mainScreenBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(mainScreenBox, 1); // VERTICAL
+
+            // 1. Top Unified Header Row
             Object headerRow = llCtor.newInstance(sysContext);
-            llCls.getMethod("setOrientation", int.class).invoke(headerRow, 0); // HORIZONTAL
-            llCls.getMethod("setGravity", int.class).invoke(headerRow, 16);    // CENTER_VERTICAL
+            setOrient.invoke(headerRow, 0); // HORIZONTAL
+            llSetGrav.invoke(headerRow, 16); // CENTER_VERTICAL
 
-            Object titleTv = tvCtor.newInstance(sysContext);
-            setTextViewStyle(titleTv, "📡 HKG 5W USB Wi-Fi 핫스팟 — 동작 현황 대시보드 (v" + UI_VERSION + ")", 20.0f, 0xFF38BDF8, true);
-            Object titleLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, titleTv, titleLp);
+            // Mode Switcher Pill Box ([핫스팟 모드 (AP)] <-> [와이파이 수신 (Client)])
+            Object modeSwitchBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(modeSwitchBox, 0);
+            setPad.invoke(modeSwitchBox, 4, 4, 4, 4);
+            setRoundedBg(modeSwitchBox, 0xFF020617, 0xFF334155, 1, 12f);
 
-            Object sysInfoTv = tvCtor.newInstance(sysContext);
-            setTextViewStyle(sysInfoTv, "  🖥 로딩 중...  ", 14.5f, 0xFFA7F3D0, true);
-            tvSetGravity.invoke(sysInfoTv, 17);
-            setRoundedBg(sysInfoTv, 0xFF1E293B, 0xFF475569, 1, 10f);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(sysInfoTv, 14, 8, 14, 8);
-            Object sysInfoLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-            setMargins(sysInfoLp, 8, 0, 12, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, sysInfoTv, sysInfoLp);
-
-            Object closeBtn = tvCtor.newInstance(sysContext);
-            setTextViewStyle(closeBtn, "  ✖ 닫기  ", 15.5f, 0xFFFFFFFF, true);
-            tvSetGravity.invoke(closeBtn, 17);
-            setRoundedBg(closeBtn, 0xFFDC2626, 0xFFF87171, 2, 10f);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(closeBtn, 20, 9, 20, 9);
-            attachClickListener(closeBtn, new Runnable() {
+            tabModeApBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(tabModeApBtn, "📡 핫스팟 모드 (AP)", 13.5f, 0xFFFFFFFF, true);
+            tvSetGravity.invoke(tabModeApBtn, 17);
+            setPad.invoke(tabModeApBtn, 16, 8, 16, 8);
+            setRoundedBg(tabModeApBtn, 0xFF0284C7, 0xFF38BDF8, 1, 9f);
+            attachClickListener(tabModeApBtn, new Runnable() {
                 @Override
                 public void run() {
-                    hide();
+                    switchWifiModeFromUi("ap");
                 }
             });
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(headerRow, closeBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, headerRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+            addView.invoke(modeSwitchBox, tabModeApBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
 
-            // Divider
-            Object div1 = viewCls.getConstructor(ctxCls).newInstance(sysContext);
-            viewCls.getMethod("setBackgroundColor", int.class).invoke(div1, 0xFF334155);
-            Object divLp1 = llLpCtor2.newInstance(MATCH_PARENT, 2);
-            setMargins(divLp1, 0, 10, 0, 12);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, div1, divLp1);
+            tabModeStaBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(tabModeStaBtn, "📶 와이파이 수신 (Client)", 13.5f, 0xFF94A3B8, true);
+            tvSetGravity.invoke(tabModeStaBtn, 17);
+            setPad.invoke(tabModeStaBtn, 16, 8, 16, 8);
+            setRoundedBg(tabModeStaBtn, 0x00000000, 0x00000000, 0, 9f);
+            attachClickListener(tabModeStaBtn, new Runnable() {
+                @Override
+                public void run() {
+                    switchWifiModeFromUi("sta");
+                }
+            });
+            Object staTabLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(staTabLp, 4, 0, 0, 0);
+            addView.invoke(modeSwitchBox, tabModeStaBtn, staTabLp);
+            addView.invoke(headerRow, modeSwitchBox, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
 
-            // 2. Two-Column Body Row
-            Object bodyRow = llCtor.newInstance(sysContext);
-            llCls.getMethod("setOrientation", int.class).invoke(bodyRow, 0); // HORIZONTAL
+            // Status Pill Badge (no LTE/hotspot sharing sub-phrase per user request)
+            statusPillTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(statusPillTv, "● 핫스팟 신호 송출 중", 13.5f, 0xFF6EE7B7, true);
+            tvSetGravity.invoke(statusPillTv, 17);
+            setPad.invoke(statusPillTv, 16, 7, 16, 7);
+            setRoundedBg(statusPillTv, 0x3310B981, 0x6634D399, 1, 20f);
+            Object pillLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(pillLp, 12, 0, 12, 0);
+            addView.invoke(headerRow, statusPillTv, pillLp);
 
-            // Left Column Card
-            Object leftCard = llCtor.newInstance(sysContext);
-            llCls.getMethod("setOrientation", int.class).invoke(leftCard, 1);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(leftCard, 16, 12, 16, 12);
-            setRoundedBg(leftCard, 0xFF1E293B, 0xFF475569, 1, 12f);
+            // Header Flexible Spacer
+            Object hdrSpacer = viewCls.getConstructor(ctxCls).newInstance(sysContext);
+            addView.invoke(headerRow, hdrSpacer, llLpCtor3.newInstance(0, 1, 1.0f));
 
-            Object leftHdr = tvCtor.newInstance(sysContext);
-            setTextViewStyle(leftHdr, "[ 1. 하드웨어 · 커널 드라이버 · 네트워크 인터페이스 ]", 16.5f, 0xFF34D399, true);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, leftHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-            Object leftTv = tvCtor.newInstance(sysContext);
-            setTextViewStyle(leftTv, "", 14.5f, 0xFFE2E8F0, false);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(leftTv, 0, 8, 0, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, leftTv, llLpCtor3.newInstance(MATCH_PARENT, WRAP_CONTENT, 1.0f));
-
-            Object leftCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.0f);
-            setMargins(leftCardLp, 0, 0, 8, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(bodyRow, leftCard, leftCardLp);
-
-            // Right Column Card
-            Object rightCard = llCtor.newInstance(sysContext);
-            llCls.getMethod("setOrientation", int.class).invoke(rightCard, 1);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(rightCard, 16, 12, 16, 12);
-            setRoundedBg(rightCard, 0xFF1E293B, 0xFF475569, 1, 12f);
-
-            Object rightHdr = tvCtor.newInstance(sysContext);
-            setTextViewStyle(rightHdr, "[ 2. SoftAP 핫스팟 · 접속 클라이언트 · 실시간 로그 ]", 16.5f, 0xFFFBBF24, true);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, rightHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-            Object rightTv = tvCtor.newInstance(sysContext);
-            setTextViewStyle(rightTv, "", 14.5f, 0xFFE2E8F0, false);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(rightTv, 0, 8, 0, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(rightCard, rightTv, llLpCtor3.newInstance(MATCH_PARENT, WRAP_CONTENT, 1.0f));
-
-            Object rightCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.12f);
-            setMargins(rightCardLp, 8, 0, 0, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(bodyRow, rightCard, rightCardLp);
-
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, bodyRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-            // 3. Action Buttons Row
-            Object btnRow = llCtor.newInstance(sysContext);
-            llCls.getMethod("setOrientation", int.class).invoke(btnRow, 0); // HORIZONTAL
-            llCls.getMethod("setGravity", int.class).invoke(btnRow, 17);    // CENTER
-            Object btnRowLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
-            setMargins(btnRowLp, 0, 12, 0, 6);
-
-            // Button 1: Force Restart Hotspot
+            // Header Action Buttons: [🔄 재시작] [💾 로그 저장] [🔧 상세 정보] [✖ 닫기]
             Object restartBtn = tvCtor.newInstance(sysContext);
-            setTextViewStyle(restartBtn, "🔄 핫스팟 즉시 재시작", 14.5f, 0xFFFFFFFF, true);
+            setTextViewStyle(restartBtn, "🔄 재시작", 13.5f, 0xFFFFFFFF, true);
             tvSetGravity.invoke(restartBtn, 17);
-            setRoundedBg(restartBtn, 0xFF0284C7, 0xFF38BDF8, 2, 10f);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(restartBtn, 10, 10, 10, 10);
+            setPad.invoke(restartBtn, 16, 9, 16, 9);
+            setRoundedBg(restartBtn, 0xFF0284C7, 0xFF38BDF8, 1, 11f);
             attachClickListener(restartBtn, new Runnable() {
                 @Override
                 public void run() {
                     triggerRestartHotspotFromUi();
                 }
             });
-            Object restartBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-            setMargins(restartBtnLp, 0, 0, 6, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, restartBtn, restartBtnLp);
+            Object rBtnLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(rBtnLp, 0, 0, 8, 0);
+            addView.invoke(headerRow, restartBtn, rBtnLp);
 
-            // Button 2: Toggle 2.4GHz <-> 5GHz
-            Object bandBtn = tvCtor.newInstance(sysContext);
-            setTextViewStyle(bandBtn, "📻 대역 변경 (2.4G ↔ 5G)", 14.5f, 0xFFFFFFFF, true);
-            tvSetGravity.invoke(bandBtn, 17);
-            setRoundedBg(bandBtn, 0xFF7C3AED, 0xFFA78BFA, 2, 10f);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(bandBtn, 10, 10, 10, 10);
-            attachClickListener(bandBtn, new Runnable() {
-                @Override
-                public void run() {
-                    toggleBandFromUi();
-                }
-            });
-            Object bandBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-            setMargins(bandBtnLp, 6, 0, 6, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, bandBtn, bandBtnLp);
-
-            // Button 3: Toggle Subnet (AUTO / 192.168.0.1 / 192.168.43.1)
-            Object subnetBtn = tvCtor.newInstance(sysContext);
-            setTextViewStyle(subnetBtn, "🌐 IP 대역 (.0.1 ↔ .43.1)", 14.5f, 0xFFFFFFFF, true);
-            tvSetGravity.invoke(subnetBtn, 17);
-            setRoundedBg(subnetBtn, 0xFF2563EB, 0xFF60A5FA, 2, 10f);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(subnetBtn, 10, 10, 10, 10);
-            attachClickListener(subnetBtn, new Runnable() {
-                @Override
-                public void run() {
-                    toggleSubnetFromUi();
-                }
-            });
-            Object subnetBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-            setMargins(subnetBtnLp, 6, 0, 6, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, subnetBtn, subnetBtnLp);
-
-            // Button 4: Export Diagnostic Logs to USB
             Object dumpBtn = tvCtor.newInstance(sysContext);
-            setTextViewStyle(dumpBtn, "💾 USB로 진단 로그 저장", 14.5f, 0xFFFFFFFF, true);
+            setTextViewStyle(dumpBtn, "💾 로그 저장", 13.5f, 0xFFFFFFFF, true);
             tvSetGravity.invoke(dumpBtn, 17);
-            setRoundedBg(dumpBtn, 0xFF059669, 0xFF34D399, 2, 10f);
-            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(dumpBtn, 10, 10, 10, 10);
+            setPad.invoke(dumpBtn, 16, 9, 16, 9);
+            setRoundedBg(dumpBtn, 0xFF059669, 0xFF34D399, 1, 11f);
             attachClickListener(dumpBtn, new Runnable() {
                 @Override
                 public void run() {
                     triggerExportLogsFromUi();
                 }
             });
-            Object dumpBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-            setMargins(dumpBtnLp, 6, 0, 0, 0);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(btnRow, dumpBtn, dumpBtnLp);
+            Object dBtnLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(dBtnLp, 0, 0, 8, 0);
+            addView.invoke(headerRow, dumpBtn, dBtnLp);
 
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, btnRow, btnRowLp);
+            expertToggleBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(expertToggleBtn, "🔧 상세 정보", 13.5f, 0xFFE2E8F0, true);
+            tvSetGravity.invoke(expertToggleBtn, 17);
+            setPad.invoke(expertToggleBtn, 16, 9, 16, 9);
+            setRoundedBg(expertToggleBtn, 0xFF1E293B, 0xFF475569, 1, 11f);
+            attachClickListener(expertToggleBtn, new Runnable() {
+                @Override
+                public void run() {
+                    isExpertView = !isExpertView;
+                    postToUi(REFRESH_TASK);
+                }
+            });
+            Object eBtnLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(eBtnLp, 0, 0, 8, 0);
+            addView.invoke(headerRow, expertToggleBtn, eBtnLp);
 
-            // 4. Footer Status Line
-            Object footerTv = tvCtor.newInstance(sysContext);
-            setTextViewStyle(footerTv, actionBannerMsg, 14.5f, 0xFF93C5FD, false);
-            tvCls.getMethod("setGravity", int.class).invoke(footerTv, 17);
-            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, footerTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+            Object closeBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(closeBtn, "✖ 닫기", 14.0f, 0xFFFFFFFF, true);
+            tvSetGravity.invoke(closeBtn, 17);
+            setPad.invoke(closeBtn, 20, 9, 20, 9);
+            setRoundedBg(closeBtn, 0xFFE11D48, 0xFFFDA4AF, 1, 11f);
+            attachClickListener(closeBtn, new Runnable() {
+                @Override
+                public void run() {
+                    hide();
+                }
+            });
+            addView.invoke(headerRow, closeBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(mainScreenBox, headerRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
 
-            return new Object[]{root, leftTv, rightTv, footerTv, sysInfoTv};
+            // Header Divider
+            Object div1 = viewCls.getConstructor(ctxCls).newInstance(sysContext);
+            viewCls.getMethod("setBackgroundColor", int.class).invoke(div1, 0xFF1E293B);
+            Object divLp1 = llLpCtor2.newInstance(MATCH_PARENT, 2);
+            setMargins(divLp1, 0, 10, 0, 10);
+            addView.invoke(mainScreenBox, div1, divLp1);
+
+            // =====================================================================
+            // 2-A. AP MODE VIEW (Horizontal 3-Column 4:4:4 Wide Layout)
+            // =====================================================================
+            apViewBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(apViewBox, 0); // HORIZONTAL
+
+            // [AP Col 1: SSID & Band]
+            Object apCol1 = llCtor.newInstance(sysContext);
+            setOrient.invoke(apCol1, 1);
+            setPad.invoke(apCol1, 16, 14, 16, 14);
+            setRoundedBg(apCol1, 0xFF1E293B, 0xFF334155, 1, 16f);
+
+            Object apCol1Hdr = llCtor.newInstance(sysContext);
+            setOrient.invoke(apCol1Hdr, 0);
+            llSetGrav.invoke(apCol1Hdr, 16);
+            Object apCol1Title = tvCtor.newInstance(sysContext);
+            setTextViewStyle(apCol1Title, "1. 핫스팟 이름 (SSID)", 13.0f, 0xFF38BDF8, true);
+            addView.invoke(apCol1Hdr, apCol1Title, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+            Object editSsidBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(editSsidBtn, "✏️ 이름 변경", 12.5f, 0xFFFFFFFF, true);
+            setPad.invoke(editSsidBtn, 12, 6, 12, 6);
+            setRoundedBg(editSsidBtn, 0xFF0284C7, 0xFF38BDF8, 1, 8f);
+            attachClickListener(editSsidBtn, new Runnable() {
+                @Override
+                public void run() {
+                    openEditModalOnUi("ap_ssid");
+                }
+            });
+            addView.invoke(apCol1Hdr, editSsidBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(apCol1, apCol1Hdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object ssidBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(ssidBox, 1);
+            setPad.invoke(ssidBox, 14, 12, 14, 12);
+            setRoundedBg(ssidBox, 0xFF0F172A, 0xFF334155, 1, 12f);
+            attachClickListener(ssidBox, new Runnable() {
+                @Override
+                public void run() {
+                    openEditModalOnUi("ap_ssid");
+                }
+            });
+            apSsidTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(apSsidTv, "HKG_USB_Hotspot", 20.0f, 0xFFFFFFFF, true);
+            addView.invoke(ssidBox, apSsidTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+            apSsidHintTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(apSsidHintTv, "✔ 휴대폰 Wi-Fi 목록에서 이 이름을 선택하세요", 12.0f, 0xFF34D399, true);
+            Object hintLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(hintLp, 0, 6, 0, 0);
+            addView.invoke(ssidBox, apSsidHintTv, hintLp);
+            Object ssidBoxLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(ssidBoxLp, 0, 10, 0, 0);
+            addView.invoke(apCol1, ssidBox, ssidBoxLp);
+
+            addView.invoke(apCol1, viewCls.getConstructor(ctxCls).newInstance(sysContext), llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f));
+
+            Object bandHdrRow = llCtor.newInstance(sysContext);
+            setOrient.invoke(bandHdrRow, 0);
+            Object bandLbl = tvCtor.newInstance(sysContext);
+            setTextViewStyle(bandLbl, "송출 주파수 대역", 12.5f, 0xFFE2E8F0, true);
+            addView.invoke(bandHdrRow, bandLbl, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+            apBandDescTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(apBandDescTv, "2.4GHz (넓은 범위)", 12.0f, 0xFF7DD3FC, true);
+            addView.invoke(bandHdrRow, apBandDescTv, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(apCol1, bandHdrRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object bandSwitchRow = llCtor.newInstance(sysContext);
+            setOrient.invoke(bandSwitchRow, 0);
+            setPad.invoke(bandSwitchRow, 4, 4, 4, 4);
+            setRoundedBg(bandSwitchRow, 0xFF020617, 0xFF334155, 1, 11f);
+            band24Btn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(band24Btn, "2.4GHz 일반", 13.0f, 0xFFFFFFFF, true);
+            tvSetGravity.invoke(band24Btn, 17);
+            setPad.invoke(band24Btn, 8, 9, 8, 9);
+            setRoundedBg(band24Btn, 0xFF0284C7, 0xFF38BDF8, 1, 8f);
+            attachClickListener(band24Btn, new Runnable() {
+                @Override
+                public void run() {
+                    selectBandFromUi("g");
+                }
+            });
+            addView.invoke(bandSwitchRow, band24Btn, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+
+            band5Btn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(band5Btn, "5GHz 고속", 13.0f, 0xFF94A3B8, true);
+            tvSetGravity.invoke(band5Btn, 17);
+            setPad.invoke(band5Btn, 8, 9, 8, 9);
+            setRoundedBg(band5Btn, 0x00000000, 0x00000000, 0, 8f);
+            attachClickListener(band5Btn, new Runnable() {
+                @Override
+                public void run() {
+                    selectBandFromUi("a");
+                }
+            });
+            addView.invoke(bandSwitchRow, band5Btn, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+            Object bswLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(bswLp, 0, 6, 0, 0);
+            addView.invoke(apCol1, bandSwitchRow, bswLp);
+
+            Object apCol1Lp = llLpCtor3.newInstance(0, MATCH_PARENT, 4.0f);
+            setMargins(apCol1Lp, 0, 0, 8, 0);
+            addView.invoke(apViewBox, apCol1, apCol1Lp);
+
+            // [AP Col 2: Password & Combined Editor]
+            Object apCol2 = llCtor.newInstance(sysContext);
+            setOrient.invoke(apCol2, 1);
+            setPad.invoke(apCol2, 16, 14, 16, 14);
+            setRoundedBg(apCol2, 0xFF1E293B, 0xFF334155, 1, 16f);
+
+            Object apCol2Hdr = llCtor.newInstance(sysContext);
+            setOrient.invoke(apCol2Hdr, 0);
+            llSetGrav.invoke(apCol2Hdr, 16);
+            Object apCol2Title = tvCtor.newInstance(sysContext);
+            setTextViewStyle(apCol2Title, "2. 핫스팟 비밀번호", 13.0f, 0xFFFBBF24, true);
+            addView.invoke(apCol2Hdr, apCol2Title, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+
+            pwMaskToggleBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(pwMaskToggleBtn, "숨김", 12.0f, 0xFFE2E8F0, true);
+            setPad.invoke(pwMaskToggleBtn, 10, 6, 10, 6);
+            setRoundedBg(pwMaskToggleBtn, 0xFF0F172A, 0xFF475569, 1, 8f);
+            attachClickListener(pwMaskToggleBtn, new Runnable() {
+                @Override
+                public void run() {
+                    isPwMasked = !isPwMasked;
+                    postToUi(REFRESH_TASK);
+                }
+            });
+            Object pwMaskLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(pwMaskLp, 0, 0, 6, 0);
+            addView.invoke(apCol2Hdr, pwMaskToggleBtn, pwMaskLp);
+
+            Object editPassBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(editPassBtn, "✏️ 비밀번호 변경", 12.5f, 0xFFFFFFFF, true);
+            setPad.invoke(editPassBtn, 12, 6, 12, 6);
+            setRoundedBg(editPassBtn, 0xFFD97706, 0xFFFBBF24, 1, 8f);
+            attachClickListener(editPassBtn, new Runnable() {
+                @Override
+                public void run() {
+                    openEditModalOnUi("ap_pass");
+                }
+            });
+            addView.invoke(apCol2Hdr, editPassBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(apCol2, apCol2Hdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object passBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(passBox, 1);
+            setPad.invoke(passBox, 14, 12, 14, 12);
+            setRoundedBg(passBox, 0xFF0F172A, 0xFF334155, 1, 12f);
+            attachClickListener(passBox, new Runnable() {
+                @Override
+                public void run() {
+                    openEditModalOnUi("ap_pass");
+                }
+            });
+            apPassTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(apPassTv, "12345678", 20.0f, 0xFFFCD34D, true);
+            addView.invoke(passBox, apPassTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+            Object passSubTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(passSubTv, "🔒 WPA2 보안 (8자리 이상)", 12.0f, 0xFF94A3B8, false);
+            Object passSubLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(passSubLp, 0, 6, 0, 0);
+            addView.invoke(passBox, passSubTv, passSubLp);
+            Object passBoxLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(passBoxLp, 0, 10, 0, 0);
+            addView.invoke(apCol2, passBox, passBoxLp);
+
+            addView.invoke(apCol2, viewCls.getConstructor(ctxCls).newInstance(sysContext), llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f));
+
+            Object easyHdrRow = llCtor.newInstance(sysContext);
+            setOrient.invoke(easyHdrRow, 0);
+            Object easyLbl = tvCtor.newInstance(sysContext);
+            setTextViewStyle(easyLbl, "간편 설정", 12.5f, 0xFFE2E8F0, true);
+            addView.invoke(easyHdrRow, easyLbl, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+            Object easySub = tvCtor.newInstance(sysContext);
+            setTextViewStyle(easySub, "차량용 화면 키보드 내장", 12.0f, 0xFF94A3B8, false);
+            addView.invoke(easyHdrRow, easySub, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(apCol2, easyHdrRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object editBothBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(editBothBtn, "✏️ 핫스팟 이름 · 비밀번호 한번에 수정하기", 13.0f, 0xFFFFFFFF, true);
+            tvSetGravity.invoke(editBothBtn, 17);
+            setPad.invoke(editBothBtn, 12, 11, 12, 11);
+            setRoundedBg(editBothBtn, 0xFF4F46E5, 0xFF818CF8, 1, 11f);
+            attachClickListener(editBothBtn, new Runnable() {
+                @Override
+                public void run() {
+                    openEditModalOnUi("ap_both");
+                }
+            });
+            Object ebLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(ebLp, 0, 6, 0, 0);
+            addView.invoke(apCol2, editBothBtn, ebLp);
+
+            Object apCol2Lp = llLpCtor3.newInstance(0, MATCH_PARENT, 4.0f);
+            setMargins(apCol2Lp, 8, 0, 8, 0);
+            addView.invoke(apViewBox, apCol2, apCol2Lp);
+
+            // [AP Col 3: Connected Devices & Data Traffic]
+            Object apCol3 = llCtor.newInstance(sysContext);
+            setOrient.invoke(apCol3, 1);
+            setPad.invoke(apCol3, 16, 14, 16, 14);
+            setRoundedBg(apCol3, 0xFF1E293B, 0xFF334155, 1, 16f);
+
+            Object apCol3Hdr = llCtor.newInstance(sysContext);
+            setOrient.invoke(apCol3Hdr, 0);
+            llSetGrav.invoke(apCol3Hdr, 16);
+            Object apCol3Title = tvCtor.newInstance(sysContext);
+            setTextViewStyle(apCol3Title, "3. 내 차에 연결된 기기", 13.0f, 0xFF34D399, true);
+            addView.invoke(apCol3Hdr, apCol3Title, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+            apClientCountBadgeTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(apClientCountBadgeTv, "0대 연결됨", 12.0f, 0xFF6EE7B7, true);
+            setPad.invoke(apClientCountBadgeTv, 10, 4, 10, 4);
+            setRoundedBg(apClientCountBadgeTv, 0x3310B981, 0x6634D399, 1, 12f);
+            addView.invoke(apCol3Hdr, apClientCountBadgeTv, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(apCol3, apCol3Hdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            apClientListTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(apClientListTv, "현재 연결된 기기가 없습니다.", 13.5f, 0xFFE2E8F0, false);
+            setPad.invoke(apClientListTv, 12, 10, 12, 10);
+            setRoundedBg(apClientListTv, 0xFF0F172A, 0xFF334155, 1, 12f);
+            Object clLp = llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f);
+            setMargins(clLp, 0, 10, 0, 10);
+            addView.invoke(apCol3, apClientListTv, clLp);
+
+            Object apTrafRow = llCtor.newInstance(sysContext);
+            setOrient.invoke(apTrafRow, 0);
+            Object apTrafLbl = tvCtor.newInstance(sysContext);
+            setTextViewStyle(apTrafLbl, "공유 데이터량", 12.5f, 0xFF94A3B8, true);
+            addView.invoke(apTrafRow, apTrafLbl, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+            apTrafficTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(apTrafficTv, "⬇ 0 B  /  ⬆ 0 B", 12.5f, 0xFF7DD3FC, true);
+            addView.invoke(apTrafRow, apTrafficTv, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(apCol3, apTrafRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object apCol3Lp = llLpCtor3.newInstance(0, MATCH_PARENT, 4.0f);
+            setMargins(apCol3Lp, 8, 0, 0, 0);
+            addView.invoke(apViewBox, apCol3, apCol3Lp);
+
+            addView.invoke(mainScreenBox, apViewBox, llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f));
+
+            // =====================================================================
+            // 2-B. CLIENT (STA) MODE VIEW (Horizontal 3-Column 4:5:3 Wide Layout)
+            // =====================================================================
+            staViewBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(staViewBox, 0); // HORIZONTAL
+            setVis.invoke(staViewBox, 8); // GONE initially
+
+            // [STA Col 1: Connected Wi-Fi Info & Manual/Disconnect]
+            Object staCol1 = llCtor.newInstance(sysContext);
+            setOrient.invoke(staCol1, 1);
+            setPad.invoke(staCol1, 16, 14, 16, 14);
+            setRoundedBg(staCol1, 0xFF1E293B, 0xFF334155, 1, 16f);
+
+            Object staCol1Hdr = llCtor.newInstance(sysContext);
+            setOrient.invoke(staCol1Hdr, 0);
+            llSetGrav.invoke(staCol1Hdr, 16);
+            Object staCol1Title = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staCol1Title, "1. 현재 연결된 와이파이", 13.0f, 0xFF38BDF8, true);
+            addView.invoke(staCol1Hdr, staCol1Title, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+            staConnBadgeTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staConnBadgeTv, "⚪ 대기 중", 12.0f, 0xFFFCD34D, true);
+            setPad.invoke(staConnBadgeTv, 10, 4, 10, 4);
+            setRoundedBg(staConnBadgeTv, 0x33F59E0B, 0x66FBBF24, 1, 12f);
+            addView.invoke(staCol1Hdr, staConnBadgeTv, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(staCol1, staCol1Hdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object staConnCard = llCtor.newInstance(sysContext);
+            setOrient.invoke(staConnCard, 1);
+            setPad.invoke(staConnCard, 14, 12, 14, 12);
+            setRoundedBg(staConnCard, 0xFF0F172A, 0xFF10B981, 1, 12f);
+            staConnectedSsidTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staConnectedSsidTv, "연결된 Wi-Fi 없음", 18.0f, 0xFFFFFFFF, true);
+            addView.invoke(staConnCard, staConnectedSsidTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+            staConnectedDetailTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staConnectedDetailTv, "• 우측 목록에서 Wi-Fi를 터치해 연결하세요", 12.5f, 0xFFCBD5E1, false);
+            Object scdLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(scdLp, 0, 8, 0, 0);
+            addView.invoke(staConnCard, staConnectedDetailTv, scdLp);
+            Object sccLp = llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f);
+            setMargins(sccLp, 0, 10, 0, 10);
+            addView.invoke(staCol1, staConnCard, sccLp);
+
+            Object staActRow = llCtor.newInstance(sysContext);
+            setOrient.invoke(staActRow, 0);
+            Object staManualBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staManualBtn, "➕ 직접 SSID 입력", 12.5f, 0xFF7DD3FC, true);
+            tvSetGravity.invoke(staManualBtn, 17);
+            setPad.invoke(staManualBtn, 8, 10, 8, 10);
+            setRoundedBg(staManualBtn, 0xFF0F172A, 0xFF475569, 1, 10f);
+            attachClickListener(staManualBtn, new Runnable() {
+                @Override
+                public void run() {
+                    openEditModalOnUi("sta_manual");
+                }
+            });
+            Object smBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
+            setMargins(smBtnLp, 0, 0, 6, 0);
+            addView.invoke(staActRow, staManualBtn, smBtnLp);
+
+            Object staDiscBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staDiscBtn, "🔌 연결 해제", 12.5f, 0xFFFECDD3, true);
+            tvSetGravity.invoke(staDiscBtn, 17);
+            setPad.invoke(staDiscBtn, 8, 10, 8, 10);
+            setRoundedBg(staDiscBtn, 0x44E11D48, 0x88F43F5E, 1, 10f);
+            attachClickListener(staDiscBtn, new Runnable() {
+                @Override
+                public void run() {
+                    disconnectStaFromUi();
+                }
+            });
+            Object sdBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
+            setMargins(sdBtnLp, 6, 0, 0, 0);
+            addView.invoke(staActRow, staDiscBtn, sdBtnLp);
+            addView.invoke(staCol1, staActRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object staCol1Lp = llLpCtor3.newInstance(0, MATCH_PARENT, 4.0f);
+            setMargins(staCol1Lp, 0, 0, 8, 0);
+            addView.invoke(staViewBox, staCol1, staCol1Lp);
+
+            // [STA Col 2: Nearby Wi-Fi Scan List (4 tappable rows)]
+            Object staCol2 = llCtor.newInstance(sysContext);
+            setOrient.invoke(staCol2, 1);
+            setPad.invoke(staCol2, 16, 14, 16, 14);
+            setRoundedBg(staCol2, 0xFF1E293B, 0xFF334155, 1, 16f);
+
+            Object staCol2Hdr = llCtor.newInstance(sysContext);
+            setOrient.invoke(staCol2Hdr, 0);
+            llSetGrav.invoke(staCol2Hdr, 16);
+            Object staCol2Title = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staCol2Title, "2. 주변 Wi-Fi 네트워크 선택 (터치하여 연결)", 13.0f, 0xFFFBBF24, true);
+            addView.invoke(staCol2Hdr, staCol2Title, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+            Object rescanBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(rescanBtn, "🔄 다시 검색", 12.0f, 0xFFFFFFFF, true);
+            setPad.invoke(rescanBtn, 12, 6, 12, 6);
+            setRoundedBg(rescanBtn, 0xFFD97706, 0xFFFBBF24, 1, 8f);
+            attachClickListener(rescanBtn, new Runnable() {
+                @Override
+                public void run() {
+                    triggerStaScanFromUi();
+                }
+            });
+            addView.invoke(staCol2Hdr, rescanBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(staCol2, staCol2Hdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            for (int i = 0; i < 4; i++) {
+                final int rowIdx = i;
+                Object sRow = llCtor.newInstance(sysContext);
+                setOrient.invoke(sRow, 0);
+                llSetGrav.invoke(sRow, 16);
+                setPad.invoke(sRow, 12, 6, 12, 6);
+                setRoundedBg(sRow, 0xFF0F172A, 0xFF334155, 1, 10f);
+                attachClickListener(sRow, new Runnable() {
+                    @Override
+                    public void run() {
+                        String targetSsid = staScanRowSsids[rowIdx];
+                        if (targetSsid != null && !targetSsid.isEmpty()) {
+                            openStaConnectModalOnUi(targetSsid);
+                        } else {
+                            openEditModalOnUi("sta_manual");
+                        }
+                    }
+                });
+                Object sRowTextCol = llCtor.newInstance(sysContext);
+                setOrient.invoke(sRowTextCol, 1);
+                Object sTitleTv = tvCtor.newInstance(sysContext);
+                setTextViewStyle(sTitleTv, "📶 검색 중...", 13.5f, 0xFFFFFFFF, true);
+                addView.invoke(sRowTextCol, sTitleTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+                Object sSubTv = tvCtor.newInstance(sysContext);
+                setTextViewStyle(sSubTv, "터치하여 연결 설정", 11.5f, 0xFF94A3B8, false);
+                addView.invoke(sRowTextCol, sSubTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+                addView.invoke(sRow, sRowTextCol, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+
+                Object sBandTv = tvCtor.newInstance(sysContext);
+                setTextViewStyle(sBandTv, "🔒", 12.0f, 0xFF7DD3FC, true);
+                addView.invoke(sRow, sBandTv, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+
+                staScanRowViews[i] = sRow;
+                staScanRowTitleTvs[i] = sTitleTv;
+                staScanRowSubTvs[i] = sSubTv;
+                staScanRowBandTvs[i] = sBandTv;
+
+                Object sRowLp = llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f);
+                setMargins(sRowLp, 0, 6, 0, 0);
+                addView.invoke(staCol2, sRow, sRowLp);
+            }
+
+            Object staCol2Lp = llLpCtor3.newInstance(0, MATCH_PARENT, 5.0f);
+            setMargins(staCol2Lp, 8, 0, 8, 0);
+            addView.invoke(staViewBox, staCol2, staCol2Lp);
+
+            // [STA Col 3: Saved Wi-Fi & Data Traffic]
+            Object staCol3 = llCtor.newInstance(sysContext);
+            setOrient.invoke(staCol3, 1);
+            setPad.invoke(staCol3, 16, 14, 16, 14);
+            setRoundedBg(staCol3, 0xFF1E293B, 0xFF334155, 1, 16f);
+
+            Object staCol3Hdr = llCtor.newInstance(sysContext);
+            setOrient.invoke(staCol3Hdr, 0);
+            Object staCol3Title = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staCol3Title, "3. 저장된 Wi-Fi", 13.0f, 0xFF34D399, true);
+            addView.invoke(staCol3Hdr, staCol3Title, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+            Object staAutoLbl = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staAutoLbl, "자동 연결", 12.0f, 0xFF94A3B8, false);
+            addView.invoke(staCol3Hdr, staAutoLbl, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(staCol3, staCol3Hdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            staSavedListTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staSavedListTv, "저장된 네트워크 없음", 13.0f, 0xFFE2E8F0, false);
+            setPad.invoke(staSavedListTv, 12, 10, 12, 10);
+            setRoundedBg(staSavedListTv, 0xFF0F172A, 0xFF334155, 1, 12f);
+            Object sslLp = llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f);
+            setMargins(sslLp, 0, 10, 0, 10);
+            addView.invoke(staCol3, staSavedListTv, sslLp);
+
+            staTrafficTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staTrafficTv, "⬇ 수신 데이터 : 0 B\n⬆ 송신 데이터 : 0 B", 12.5f, 0xFF7DD3FC, true);
+            addView.invoke(staCol3, staTrafficTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object staCol3Lp = llLpCtor3.newInstance(0, MATCH_PARENT, 3.0f);
+            setMargins(staCol3Lp, 8, 0, 0, 0);
+            addView.invoke(staViewBox, staCol3, staCol3Lp);
+
+            addView.invoke(mainScreenBox, staViewBox, llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f));
+
+            // =====================================================================
+            // 2-C. EXPERT DIAGNOSTICS VIEW (Horizontal 2-Column 6:6 Wide Layout)
+            // =====================================================================
+            expertViewBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(expertViewBox, 0);
+            setVis.invoke(expertViewBox, 8); // GONE initially
+
+            Object leftCard = llCtor.newInstance(sysContext);
+            setOrient.invoke(leftCard, 1);
+            setPad.invoke(leftCard, 16, 12, 16, 12);
+            setRoundedBg(leftCard, 0xFF0F172A, 0xFF334155, 1, 14f);
+
+            Object leftHdr = tvCtor.newInstance(sysContext);
+            setTextViewStyle(leftHdr, "[ 하드웨어 · 커널 드라이버 · 라우팅 상태 ]", 14.0f, 0xFF34D399, true);
+            addView.invoke(leftCard, leftHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            leftColTextView = tvCtor.newInstance(sysContext);
+            setTextViewStyle(leftColTextView, "", 13.0f, 0xFFE2E8F0, false);
+            setPad.invoke(leftColTextView, 0, 6, 0, 6);
+            addView.invoke(leftCard, leftColTextView, llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f));
+
+            Object expLeftBot = llCtor.newInstance(sysContext);
+            setOrient.invoke(expLeftBot, 0);
+            llSetGrav.invoke(expLeftBot, 16);
+            headerSysInfoTextView = tvCtor.newInstance(sysContext);
+            setTextViewStyle(headerSysInfoTextView, "CPU --% | RAM --", 12.5f, 0xFF94A3B8, true);
+            addView.invoke(expLeftBot, headerSysInfoTextView, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+
+            subnetCycleBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(subnetCycleBtn, "🌐 AP 서브넷: AUTO", 12.5f, 0xFF93C5FD, true);
+            setPad.invoke(subnetCycleBtn, 12, 6, 12, 6);
+            setRoundedBg(subnetCycleBtn, 0xFF1E3A8A, 0xFF3B82F6, 1, 8f);
+            attachClickListener(subnetCycleBtn, new Runnable() {
+                @Override
+                public void run() {
+                    toggleSubnetFromUi();
+                }
+            });
+            addView.invoke(expLeftBot, subnetCycleBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(leftCard, expLeftBot, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object leftCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.0f);
+            setMargins(leftCardLp, 0, 0, 8, 0);
+            addView.invoke(expertViewBox, leftCard, leftCardLp);
+
+            Object rightCard = llCtor.newInstance(sysContext);
+            setOrient.invoke(rightCard, 1);
+            setPad.invoke(rightCard, 16, 12, 16, 12);
+            setRoundedBg(rightCard, 0xFF0F172A, 0xFF334155, 1, 14f);
+
+            Object rightHdr = tvCtor.newInstance(sysContext);
+            setTextViewStyle(rightHdr, "[ 실시간 데몬 로그 (/data/local/tmp/usbwifi_hotspot) ]", 14.0f, 0xFFFBBF24, true);
+            addView.invoke(rightCard, rightHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            rightColTextView = tvCtor.newInstance(sysContext);
+            setTextViewStyle(rightColTextView, "", 13.0f, 0xFFE2E8F0, false);
+            setPad.invoke(rightColTextView, 0, 6, 0, 0);
+            addView.invoke(rightCard, rightColTextView, llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f));
+
+            Object rightCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.0f);
+            setMargins(rightCardLp, 8, 0, 0, 0);
+            addView.invoke(expertViewBox, rightCard, rightCardLp);
+
+            addView.invoke(mainScreenBox, expertViewBox, llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f));
+
+            // 3. Compact 1-Line Bottom Footer
+            Object div2 = viewCls.getConstructor(ctxCls).newInstance(sysContext);
+            viewCls.getMethod("setBackgroundColor", int.class).invoke(div2, 0xFF1E293B);
+            Object divLp2 = llLpCtor2.newInstance(MATCH_PARENT, 2);
+            setMargins(divLp2, 0, 10, 0, 8);
+            addView.invoke(mainScreenBox, div2, divLp2);
+
+            Object footerRow = llCtor.newInstance(sysContext);
+            setOrient.invoke(footerRow, 0);
+            llSetGrav.invoke(footerRow, 16);
+            footerStatusTextView = tvCtor.newInstance(sysContext);
+            setTextViewStyle(footerStatusTextView, actionBannerMsg, 13.0f, 0xFF7DD3FC, true);
+            addView.invoke(footerRow, footerStatusTextView, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+
+            footerTimerTextView = tvCtor.newInstance(sysContext);
+            setTextViewStyle(footerTimerTextView, "자동 닫힘: 90초 후  |  v" + UI_VERSION, 12.5f, 0xFF94A3B8, true);
+            addView.invoke(footerRow, footerTimerTextView, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(mainScreenBox, footerRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            addView.invoke(root, mainScreenBox, llLpCtor2.newInstance(MATCH_PARENT, MATCH_PARENT));
+
+            // =====================================================================
+            // 4. WIDE LEFT-RIGHT SPLIT (4:8) IN-OVERLAY TOUCH KEYBOARD MODAL
+            // =====================================================================
+            editModalBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(editModalBox, 1); // VERTICAL
+            setVis.invoke(editModalBox, 8); // GONE initially
+
+            // Modal Top Header Bar
+            Object mHdr = llCtor.newInstance(sysContext);
+            setOrient.invoke(mHdr, 0);
+            llSetGrav.invoke(mHdr, 16);
+
+            modalTitleTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(modalTitleTv, "✏️ 내 차량 핫스팟 이름(SSID) · 비밀번호 변경", 16.0f, 0xFFFFFFFF, true);
+            addView.invoke(mHdr, modalTitleTv, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+
+            modalValidationTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(modalValidationTv, "  ✔ 우측 키보드로 입력 후 [저장 및 적용]을 누르세요", 13.0f, 0xFF34D399, true);
+            addView.invoke(mHdr, modalValidationTv, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+
+            Object mResetBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(mResetBtn, "↺ 초기값 복원", 13.0f, 0xFFE2E8F0, true);
+            setPad.invoke(mResetBtn, 14, 8, 14, 8);
+            setRoundedBg(mResetBtn, 0xFF1E293B, 0xFF475569, 1, 10f);
+            attachClickListener(mResetBtn, new Runnable() {
+                @Override
+                public void run() {
+                    editingSsid = "HKG_USB_Hotspot";
+                    editingPass = "12345678";
+                    refreshModalInputsOnUi();
+                }
+            });
+            Object mrLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(mrLp, 0, 0, 8, 0);
+            addView.invoke(mHdr, mResetBtn, mrLp);
+
+            Object mCancelBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(mCancelBtn, "✖ 취소", 13.5f, 0xFFFFFFFF, true);
+            setPad.invoke(mCancelBtn, 18, 8, 18, 8);
+            setRoundedBg(mCancelBtn, 0xFF334155, 0xFF64748B, 1, 10f);
+            attachClickListener(mCancelBtn, new Runnable() {
+                @Override
+                public void run() {
+                    isEditModalOpen = false;
+                    postToUi(REFRESH_TASK);
+                }
+            });
+            Object mcLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(mcLp, 0, 0, 8, 0);
+            addView.invoke(mHdr, mCancelBtn, mcLp);
+
+            modalSaveBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(modalSaveBtn, "✔ 저장 및 적용", 13.5f, 0xFFFFFFFF, true);
+            setPad.invoke(modalSaveBtn, 22, 8, 22, 8);
+            setRoundedBg(modalSaveBtn, 0xFF059669, 0xFF34D399, 1, 10f);
+            attachClickListener(modalSaveBtn, new Runnable() {
+                @Override
+                public void run() {
+                    saveModalAndApplyOnUi();
+                }
+            });
+            addView.invoke(mHdr, modalSaveBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(editModalBox, mHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object mDiv = viewCls.getConstructor(ctxCls).newInstance(sysContext);
+            viewCls.getMethod("setBackgroundColor", int.class).invoke(mDiv, 0xFF334155);
+            Object mDivLp = llLpCtor2.newInstance(MATCH_PARENT, 2);
+            setMargins(mDivLp, 0, 8, 0, 10);
+            addView.invoke(editModalBox, mDiv, mDivLp);
+
+            // Modal Body: Left 4 (Input Boxes + Quick Presets) / Right 8 (Full-Height 4-Row Keyboard)
+            Object mBody = llCtor.newInstance(sysContext);
+            setOrient.invoke(mBody, 0); // HORIZONTAL
+
+            Object mLeftCol = llCtor.newInstance(sysContext);
+            setOrient.invoke(mLeftCol, 1);
+
+            // Input Box 1: SSID
+            modalSsidFieldBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(modalSsidFieldBox, 1);
+            setPad.invoke(modalSsidFieldBox, 14, 10, 14, 10);
+            setRoundedBg(modalSsidFieldBox, 0xFF0F172A, 0xFF38BDF8, 2, 12f);
+            attachClickListener(modalSsidFieldBox, new Runnable() {
+                @Override
+                public void run() {
+                    activeEditField = "ssid";
+                    refreshModalInputsOnUi();
+                }
+            });
+            Object mSsidHdr = llCtor.newInstance(sysContext);
+            setOrient.invoke(mSsidHdr, 0);
+            Object mSsidLbl = tvCtor.newInstance(sysContext);
+            setTextViewStyle(mSsidLbl, "1. 와이파이 이름 (SSID)", 12.5f, 0xFF38BDF8, true);
+            addView.invoke(mSsidHdr, mSsidLbl, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+            modalSsidLenTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(modalSsidLenTv, "15 / 32자", 12.0f, 0xFFCBD5E1, true);
+            addView.invoke(mSsidHdr, modalSsidLenTv, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(modalSsidFieldBox, mSsidHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object mSsidValRow = llCtor.newInstance(sysContext);
+            setOrient.invoke(mSsidValRow, 0);
+            llSetGrav.invoke(mSsidValRow, 16);
+            modalSsidValueTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(modalSsidValueTv, "HKG_USB_Hotspot", 17.5f, 0xFFFFFFFF, true);
+            addView.invoke(mSsidValRow, modalSsidValueTv, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+            Object clrSsidBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(clrSsidBtn, "지우기", 12.0f, 0xFFCBD5E1, true);
+            setPad.invoke(clrSsidBtn, 10, 5, 10, 5);
+            setRoundedBg(clrSsidBtn, 0xFF1E293B, 0xFF475569, 1, 8f);
+            attachClickListener(clrSsidBtn, new Runnable() {
+                @Override
+                public void run() {
+                    activeEditField = "ssid";
+                    editingSsid = "";
+                    refreshModalInputsOnUi();
+                }
+            });
+            addView.invoke(mSsidValRow, clrSsidBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            Object msvrLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(msvrLp, 0, 6, 0, 0);
+            addView.invoke(modalSsidFieldBox, mSsidValRow, msvrLp);
+            addView.invoke(mLeftCol, modalSsidFieldBox, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            // Input Box 2: Password
+            modalPassFieldBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(modalPassFieldBox, 1);
+            setPad.invoke(modalPassFieldBox, 14, 10, 14, 10);
+            setRoundedBg(modalPassFieldBox, 0xFF0F172A, 0xFF334155, 2, 12f);
+            attachClickListener(modalPassFieldBox, new Runnable() {
+                @Override
+                public void run() {
+                    activeEditField = "pass";
+                    refreshModalInputsOnUi();
+                }
+            });
+            Object mPassHdr = llCtor.newInstance(sysContext);
+            setOrient.invoke(mPassHdr, 0);
+            Object mPassLbl = tvCtor.newInstance(sysContext);
+            setTextViewStyle(mPassLbl, "2. 비밀번호 (8자리 이상)", 12.5f, 0xFFFBBF24, true);
+            addView.invoke(mPassHdr, mPassLbl, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+            modalPassLenTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(modalPassLenTv, "✔ 8자 가능", 12.0f, 0xFF34D399, true);
+            addView.invoke(mPassHdr, modalPassLenTv, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(modalPassFieldBox, mPassHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object mPassValRow = llCtor.newInstance(sysContext);
+            setOrient.invoke(mPassValRow, 0);
+            llSetGrav.invoke(mPassValRow, 16);
+            modalPassValueTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(modalPassValueTv, "12345678", 17.5f, 0xFFFCD34D, true);
+            addView.invoke(mPassValRow, modalPassValueTv, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+            Object clrPassBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(clrPassBtn, "지우기", 12.0f, 0xFFCBD5E1, true);
+            setPad.invoke(clrPassBtn, 10, 5, 10, 5);
+            setRoundedBg(clrPassBtn, 0xFF1E293B, 0xFF475569, 1, 8f);
+            attachClickListener(clrPassBtn, new Runnable() {
+                @Override
+                public void run() {
+                    activeEditField = "pass";
+                    editingPass = "";
+                    refreshModalInputsOnUi();
+                }
+            });
+            addView.invoke(mPassValRow, clrPassBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            Object mpvrLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(mpvrLp, 0, 6, 0, 0);
+            addView.invoke(modalPassFieldBox, mPassValRow, mpvrLp);
+            Object mpfbLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(mpfbLp, 0, 10, 0, 10);
+            addView.invoke(mLeftCol, modalPassFieldBox, mpfbLp);
+
+            addView.invoke(mLeftCol, viewCls.getConstructor(ctxCls).newInstance(sysContext), llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f));
+
+            // Quick SSID Presets Box
+            Object presetBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(presetBox, 1);
+            setPad.invoke(presetBox, 12, 10, 12, 10);
+            setRoundedBg(presetBox, 0xFF0F172A, 0xFF1E293B, 1, 12f);
+            Object presetLbl = tvCtor.newInstance(sysContext);
+            setTextViewStyle(presetLbl, "빠른 이름 원터치 선택:", 12.0f, 0xFF94A3B8, true);
+            addView.invoke(presetBox, presetLbl, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            final String[][] presets = new String[][]{
+                    {"HKG_USB_Hotspot", "NiroEV_WiFi"},
+                    {"EV6_Hotspot", "My_Phone_Hotspot"}
+            };
+            for (int r = 0; r < presets.length; r++) {
+                Object pRow = llCtor.newInstance(sysContext);
+                setOrient.invoke(pRow, 0);
+                for (int c = 0; c < presets[r].length; c++) {
+                    final String pVal = presets[r][c];
+                    Object pBtn = tvCtor.newInstance(sysContext);
+                    setTextViewStyle(pBtn, pVal, 12.0f, 0xFF7DD3FC, true);
+                    tvSetGravity.invoke(pBtn, 17);
+                    setPad.invoke(pBtn, 8, 8, 8, 8);
+                    setRoundedBg(pBtn, 0xFF1E293B, 0xFF334155, 1, 8f);
+                    attachClickListener(pBtn, new Runnable() {
+                        @Override
+                        public void run() {
+                            activeEditField = "ssid";
+                            editingSsid = pVal;
+                            refreshModalInputsOnUi();
+                        }
+                    });
+                    Object pBtnLp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
+                    setMargins(pBtnLp, c == 0 ? 0 : 4, 6, c == 0 ? 4 : 0, 0);
+                    addView.invoke(pRow, pBtn, pBtnLp);
+                }
+                addView.invoke(presetBox, pRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+            }
+            addView.invoke(mLeftCol, presetBox, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            Object mLeftLp = llLpCtor3.newInstance(0, MATCH_PARENT, 4.0f);
+            setMargins(mLeftLp, 0, 0, 10, 0);
+            addView.invoke(mBody, mLeftCol, mLeftLp);
+
+            // Right Column (weight 8.0f): Full-Height 4-Row Touch Keyboard (flex-1 rows, h-full buttons)
+            Object kbBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(kbBox, 1);
+            setPad.invoke(kbBox, 10, 10, 10, 10);
+            setRoundedBg(kbBox, 0xFF020617, 0xFF1E293B, 1, 16f);
+
+            String[][] kbRows = new String[][]{
+                    {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "_"},
+                    {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"},
+                    {"A", "S", "D", "F", "G", "H", "J", "K", "L", "@"},
+                    {"SHIFT", "Z", "X", "C", "V", "B", "N", "M", "!", "BS"}
+            };
+            for (int r = 0; r < kbRows.length; r++) {
+                Object kRow = llCtor.newInstance(sysContext);
+                setOrient.invoke(kRow, 0);
+                for (int c = 0; c < kbRows[r].length; c++) {
+                    final String token = kbRows[r][c];
+                    Object kBtn = tvCtor.newInstance(sysContext);
+                    tvSetGravity.invoke(kBtn, 17); // CENTER
+                    float weight = 1.0f;
+                    if ("SHIFT".equals(token)) {
+                        weight = 1.35f;
+                        kbShiftBtn = kBtn;
+                        setTextViewStyle(kBtn, "⬆ 대문자", 13.0f, 0xFFFFFFFF, true);
+                        setRoundedBg(kBtn, 0xFF0284C7, 0xFF38BDF8, 1, 12f);
+                        attachClickListener(kBtn, new Runnable() {
+                            @Override
+                            public void run() {
+                                kbUpper = !kbUpper;
+                                refreshKeyboardCaseOnUi();
+                            }
+                        });
+                    } else if ("BS".equals(token)) {
+                        weight = 1.35f;
+                        setTextViewStyle(kBtn, "⌫ 지움", 13.0f, 0xFFFFFFFF, true);
+                        setRoundedBg(kBtn, 0xFFBE123C, 0xFFF43F5E, 1, 12f);
+                        attachClickListener(kBtn, new Runnable() {
+                            @Override
+                            public void run() {
+                                pressBackspaceOnUi();
+                            }
+                        });
+                    } else {
+                        setTextViewStyle(kBtn, token, 17.0f, 0xFFFFFFFF, true);
+                        setRoundedBg(kBtn, 0xFF1E293B, 0xFF334155, 1, 12f);
+                        final int letterIdx;
+                        if (token.length() == 1 && token.charAt(0) >= 'A' && token.charAt(0) <= 'Z') {
+                            letterIdx = kbLetterBtns.size();
+                            kbLetterBtns.add(kBtn);
+                            kbLetterBaseChars.add(token);
+                        } else {
+                            letterIdx = -1;
+                        }
+                        attachClickListener(kBtn, new Runnable() {
+                            @Override
+                            public void run() {
+                                String ch = token;
+                                if (letterIdx >= 0) {
+                                    ch = kbUpper ? token : token.toLowerCase(Locale.US);
+                                }
+                                pressKeyOnUi(ch);
+                            }
+                        });
+                    }
+                    Object kBtnLp = llLpCtor3.newInstance(0, MATCH_PARENT, weight);
+                    setMargins(kBtnLp, 3, 3, 3, 3);
+                    addView.invoke(kRow, kBtn, kBtnLp);
+                }
+                Object kRowLp = llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f);
+                addView.invoke(kbBox, kRow, kRowLp);
+            }
+
+            Object mRightLp = llLpCtor3.newInstance(0, MATCH_PARENT, 8.0f);
+            addView.invoke(mBody, kbBox, mRightLp);
+
+            addView.invoke(editModalBox, mBody, llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f));
+            addView.invoke(root, editModalBox, llLpCtor2.newInstance(MATCH_PARENT, MATCH_PARENT));
+
+            return root;
         }
 
         private static void showOnUiThread() {
@@ -931,11 +1878,11 @@ public class UsbWifiStatusMain {
                 Method addViewMethod = vmCls.getMethod("addView", viewCls, vgLpCls);
 
                 for (int wtype : candidateTypes) {
-                    Object[] tree = null;
+                    Object candidateRoot = null;
                     try {
-                        tree = buildDashboardViewTree();
-                        Object candidateRoot = tree[0];
-                        Object wmLp = wmLpCtor.newInstance(1220, -2, wtype, flags, -3);
+                        candidateRoot = buildDashboardViewTree();
+                        // Full-screen edge-to-edge overlay (-1 = MATCH_PARENT, -1 = MATCH_PARENT)
+                        Object wmLp = wmLpCtor.newInstance(-1, -1, wtype, flags, -3);
                         wmLpCls.getField("gravity").setInt(wmLp, 17);
                         wmLpCls.getMethod("setTitle", CharSequence.class).invoke(wmLp, "UsbWifiHotspotOverlay");
                         addViewMethod.invoke(windowManager, candidateRoot, wmLp);
@@ -951,19 +1898,16 @@ public class UsbWifiStatusMain {
                         }
 
                         rootOverlayView = candidateRoot;
-                        leftColTextView = tree[1];
-                        rightColTextView = tree[2];
-                        footerStatusTextView = tree[3];
-                        headerSysInfoTextView = tree[4];
                         isVisible = true;
+                        isEditModalOpen = false;
                         shownAtMs = System.currentTimeMillis();
-                        System.out.println("[USBWifiUI] StatusDashboardOverlay displayed (windowType=" + wtype + ")");
+                        System.out.println("[USBWifiUI] StatusDashboardOverlay full-screen displayed (windowType=" + wtype + ")");
                         refreshOnUiThread();
                         break;
                     } catch (Throwable t) {
-                        if (tree != null && tree[0] != null) {
+                        if (candidateRoot != null) {
                             try {
-                                windowManager.getClass().getMethod("removeViewImmediate", viewCls).invoke(windowManager, tree[0]);
+                                windowManager.getClass().getMethod("removeViewImmediate", viewCls).invoke(windowManager, candidateRoot);
                             } catch (Throwable ignored) {
                             }
                         }
@@ -977,11 +1921,8 @@ public class UsbWifiStatusMain {
         private static void hideOnUiThread() {
             Object oldRoot = rootOverlayView;
             rootOverlayView = null;
-            headerSysInfoTextView = null;
-            leftColTextView = null;
-            rightColTextView = null;
-            footerStatusTextView = null;
             isVisible = false;
+            isEditModalOpen = false;
             try {
                 removeCallbacksFromUi(REFRESH_TASK);
                 if (oldRoot != null && windowManager != null) {
@@ -1004,6 +1945,9 @@ public class UsbWifiStatusMain {
         private static void refreshOnUiThread() {
             if (!isVisible || rootOverlayView == null) return;
             long now = System.currentTimeMillis();
+            if (isEditModalOpen) {
+                shownAtMs = now;
+            }
             long elapsedSec = (now - shownAtMs) / 1000L;
             if (elapsedSec >= 90L) {
                 hideOnUiThread();
@@ -1011,114 +1955,526 @@ public class UsbWifiStatusMain {
             }
 
             try {
+                Class<?> viewCls = Class.forName("android.view.View");
+                Class<?> tvCls = Class.forName("android.widget.TextView");
+                Method setVis = viewCls.getMethod("setVisibility", int.class);
+                Method setText = tvCls.getMethod("setText", CharSequence.class);
+                Method setColor = tvCls.getMethod("setTextColor", int.class);
+
+                if (isEditModalOpen) {
+                    setVis.invoke(mainScreenBox, 8);
+                    setVis.invoke(editModalBox, 0);
+                    refreshModalInputsOnUi();
+                    return;
+                } else {
+                    setVis.invoke(editModalBox, 8);
+                    setVis.invoke(mainScreenBox, 0);
+                }
+
                 SystemSnapshot snap = latestSnapshot;
                 if (snap == null) {
                     return;
                 }
 
-                String daemonStr = snap.daemonAlive
-                        ? ("🟢 정상 가동 중 (PID: " + snap.daemonPid + ")")
-                        : "🔴 중지됨 (하단 [핫스팟 즉시 재시작] 터치)";
+                boolean isStaMode = "sta".equals(snap.wifiMode);
 
-                String usbStr;
-                if (snap.usbDonglePresent) {
-                    usbStr = "🟢 연결됨 — " + snap.usbDongleDesc;
-                } else if (!snap.otherUsbDevices.isEmpty()) {
-                    usbStr = "🟠 미감지 (현재 연결된 USB: " + snap.otherUsbDevices + ")";
+                // 1. Update Top Header Mode Switcher & Status Pill
+                if (isStaMode) {
+                    setRoundedBg(tabModeApBtn, 0x00000000, 0x00000000, 0, 9f);
+                    setColor.invoke(tabModeApBtn, 0xFF94A3B8);
+                    setRoundedBg(tabModeStaBtn, 0xFF059669, 0xFF34D399, 1, 9f);
+                    setColor.invoke(tabModeStaBtn, 0xFFFFFFFF);
                 } else {
-                    usbStr = "🔴 미연결 (USB 포트에 무선랜카드를 꽂아주세요)";
+                    setRoundedBg(tabModeApBtn, 0xFF0284C7, 0xFF38BDF8, 1, 9f);
+                    setColor.invoke(tabModeApBtn, 0xFFFFFFFF);
+                    setRoundedBg(tabModeStaBtn, 0x00000000, 0x00000000, 0, 9f);
+                    setColor.invoke(tabModeStaBtn, 0xFF94A3B8);
                 }
 
-                String drvStr;
-                if (snap.driverLoaded) {
-                    drvStr = "🟢 로드됨 (" + snap.driverModuleFile + " | " + snap.driverMemInfo + ")";
-                } else if (!snap.lastInsmodError.isEmpty()) {
-                    drvStr = "🔴 로드 실패: " + snap.lastInsmodError;
+                if (!snap.usbDonglePresent) {
+                    setText.invoke(statusPillTv, "● USB 무선랜카드 미연결");
+                    setColor.invoke(statusPillTv, 0xFFFDA4AF);
+                    setRoundedBg(statusPillTv, 0x33E11D48, 0x66F43F5E, 1, 20f);
+                } else if (isStaMode) {
+                    if (snap.staConnected) {
+                        setText.invoke(statusPillTv, "● [" + snap.staConnectedSsid + "] 수신 연결됨");
+                        setColor.invoke(statusPillTv, 0xFF6EE7B7);
+                        setRoundedBg(statusPillTv, 0x3310B981, 0x6634D399, 1, 20f);
+                    } else if (snap.wpaSuppAlive) {
+                        String tgt = snap.staSsid.isEmpty() ? "Wi-Fi 선택 대기 중" : ("[" + snap.staSsid + "] 연결 중...");
+                        setText.invoke(statusPillTv, "● " + tgt);
+                        setColor.invoke(statusPillTv, 0xFFFCD34D);
+                        setRoundedBg(statusPillTv, 0x33F59E0B, 0x66FBBF24, 1, 20f);
+                    } else {
+                        setText.invoke(statusPillTv, "● 수신 모드 준비 중...");
+                        setColor.invoke(statusPillTv, 0xFFFCD34D);
+                        setRoundedBg(statusPillTv, 0x33F59E0B, 0x66FBBF24, 1, 20f);
+                    }
                 } else {
-                    drvStr = snap.usbDonglePresent ? "⏳ 모듈 로드 준비 중 (" + snap.driverModuleFile + ")" : "⚪ 대기 중 (" + snap.driverModuleFile + ")";
+                    if (snap.hostapdAlive && snap.dnsmasqAlive && snap.ifaceUp) {
+                        setText.invoke(statusPillTv, "● 핫스팟 신호 송출 중");
+                        setColor.invoke(statusPillTv, 0xFF6EE7B7);
+                        setRoundedBg(statusPillTv, 0x3310B981, 0x6634D399, 1, 20f);
+                    } else {
+                        setText.invoke(statusPillTv, "● 핫스팟 신호 준비 중...");
+                        setColor.invoke(statusPillTv, 0xFFFCD34D);
+                        setRoundedBg(statusPillTv, 0x33F59E0B, 0x66FBBF24, 1, 20f);
+                    }
                 }
 
-                String ifaceStr;
-                String trafficStr;
-                if (!snap.usbIface.isEmpty()) {
-                    String st = snap.ifaceUp ? "UP" : "DOWN";
-                    String ip = snap.ifaceIp.isEmpty() ? "(IP 미할당)" : snap.ifaceIp;
-                    ifaceStr = (snap.ifaceUp ? "🟢 " : "🟠 ") + snap.usbIface + " [" + st + "] | IP: " + ip + " | MAC: " + snap.ifaceMac;
-                    trafficStr = String.format(Locale.US, "RX %d 패킷 (%s)  /  TX %d 패킷 (%s)",
-                            snap.rxPackets, formatBytes(snap.rxBytes), snap.txPackets, formatBytes(snap.txBytes));
+                setText.invoke(expertToggleBtn, isExpertView ? "✨ 간편 화면" : "🔧 상세 정보");
+
+                // 2. Toggle Active Body Panel (AP / STA / Expert)
+                if (isExpertView) {
+                    setVis.invoke(apViewBox, 8);
+                    setVis.invoke(staViewBox, 8);
+                    setVis.invoke(expertViewBox, 0);
+                } else if (isStaMode) {
+                    setVis.invoke(apViewBox, 8);
+                    setVis.invoke(expertViewBox, 8);
+                    setVis.invoke(staViewBox, 0);
                 } else {
-                    ifaceStr = "⚪ 미생성 (USB 무선랜카드 연결 시 자동 생성)";
-                    trafficStr = "RX 0 패킷 (0 B)  /  TX 0 패킷 (0 B)";
+                    setVis.invoke(staViewBox, 8);
+                    setVis.invoke(expertViewBox, 8);
+                    setVis.invoke(apViewBox, 0);
                 }
 
-                String coexistStr;
-                String usbIfLabel = snap.usbIface.isEmpty() ? "rtwlan0" : snap.usbIface;
-                if (snap.hasBuiltinBcmdhd) {
-                    String w0Info = snap.builtinWlan0Up
-                            ? ("활성" + (snap.builtinWlan0Ip.isEmpty() ? "" : " " + snap.builtinWlan0Ip))
-                            : "비활성/대기";
-                    coexistStr = "내장 Wi-Fi(bcmdhd) 보유 차량 [순정 wlan0: " + w0Info + " / USB: " + usbIfLabel + " 완벽 분리]";
+                // 3. Populate AP Mode Views
+                setText.invoke(apSsidTv, snap.apSsid);
+                if (!snap.usbDonglePresent) {
+                    setText.invoke(apSsidHintTv, "⚠ USB 포트에 무선랜카드를 꽂아주세요");
+                    setColor.invoke(apSsidHintTv, 0xFFFDA4AF);
+                } else if (snap.hostapdAlive) {
+                    setText.invoke(apSsidHintTv, "✔ 휴대폰 Wi-Fi 목록에서 이 이름을 선택하세요");
+                    setColor.invoke(apSsidHintTv, 0xFF34D399);
                 } else {
-                    coexistStr = "내장 Wi-Fi 없음 [USB 무선랜카드가 단독 " + usbIfLabel + " 사용]";
+                    setText.invoke(apSsidHintTv, "⏳ 무선 신호를 준비하고 있습니다...");
+                    setColor.invoke(apSsidHintTv, 0xFFFCD34D);
                 }
 
-                StringBuilder leftSb = new StringBuilder(640);
-                leftSb.append("• 차량 플랫폼 : ").append(snap.platform).append(" (").append(snap.model).append(") | Linux ").append(snap.kernelRel).append("\n");
-                leftSb.append("• 백그라운드 데몬 : ").append(daemonStr).append("\n");
-                leftSb.append("• USB 무선랜카드 : ").append(usbStr).append("\n");
-                leftSb.append("• 커널 드라이버 : ").append(drvStr).append("\n");
-                leftSb.append("• 무선 인터페이스 : ").append(ifaceStr).append("\n");
-                leftSb.append("• 실시간 트래픽 : ").append(trafficStr).append("\n");
-                leftSb.append("• 내장 Wi-Fi 공존 : ").append(coexistStr);
-
-                String hostapdStr = snap.hostapdAlive
-                        ? ("🟢 신호 송출 중 (PID: " + snap.hostapdPid + ")")
-                        : "🔴 중지됨";
-                String dnsmasqStr;
-                if (snap.dnsmasqAlive) {
-                    String modeTag = snap.dnsmasqShared ? "시스템 공유 PID: " : "PID: ";
-                    dnsmasqStr = "🟢 DHCP 할당 가동 중 (" + modeTag + snap.dnsmasqPid + ")";
+                boolean is5G = "a".equalsIgnoreCase(snap.apHwMode);
+                if (is5G) {
+                    setText.invoke(apBandDescTv, "5GHz (빠른 속도 · Ch " + snap.apChannel + ")");
+                    setRoundedBg(band5Btn, 0xFF7C3AED, 0xFFA78BFA, 1, 8f);
+                    setColor.invoke(band5Btn, 0xFFFFFFFF);
+                    setRoundedBg(band24Btn, 0x00000000, 0x00000000, 0, 8f);
+                    setColor.invoke(band24Btn, 0xFF94A3B8);
                 } else {
-                    dnsmasqStr = "🔴 중지됨";
+                    setText.invoke(apBandDescTv, "2.4GHz (넓은 범위 · Ch " + snap.apChannel + ")");
+                    setRoundedBg(band24Btn, 0xFF0284C7, 0xFF38BDF8, 1, 8f);
+                    setColor.invoke(band24Btn, 0xFFFFFFFF);
+                    setRoundedBg(band5Btn, 0x00000000, 0x00000000, 0, 8f);
+                    setColor.invoke(band5Btn, 0xFF94A3B8);
                 }
-                String bandDesc = "a".equalsIgnoreCase(snap.apHwMode)
-                        ? ("5GHz (Ch " + snap.apChannel + ")")
-                        : ("2.4GHz (Ch " + snap.apChannel + ")");
 
-                StringBuilder rightSb = new StringBuilder(640);
-                rightSb.append("• SoftAP (hostapd) : ").append(hostapdStr).append("\n");
-                rightSb.append("• DHCP (dnsmasq) : ").append(dnsmasqStr).append("\n");
-                rightSb.append("• 핫스팟 무선 설정 : SSID [ ").append(snap.apSsid).append(" ] | PW [ ").append(snap.apPass)
-                        .append(" ] | ").append(bandDesc).append("\n");
-                if (snap.connectedClients.isEmpty()) {
-                    rightSb.append("• 접속 클라이언트 : 0대 (현재 연결된 기기 없음)\n");
+                setText.invoke(pwMaskToggleBtn, isPwMasked ? "표시" : "숨김");
+                setText.invoke(apPassTv, isPwMasked ? "••••••••" : snap.apPass);
+
+                int cCount = snap.connectedClients.size();
+                setText.invoke(apClientCountBadgeTv, cCount + "대 연결됨");
+                if (cCount == 0) {
+                    setText.invoke(apClientListTv, "현재 연결된 기기가 없습니다.\n\n휴대폰에서 [" + snap.apSsid + "]를 선택해 연결하세요.");
                 } else {
-                    rightSb.append("• 접속 클라이언트 (").append(snap.connectedClients.size()).append("대) : ")
-                            .append(snap.connectedClients.get(0)).append("\n");
+                    StringBuilder csb = new StringBuilder();
+                    int maxShow = Math.min(4, cCount);
+                    for (int i = 0; i < maxShow; i++) {
+                        if (i > 0) csb.append("\n");
+                        csb.append("📱 ").append(snap.connectedClients.get(i));
+                    }
+                    setText.invoke(apClientListTv, csb.toString());
                 }
-                rightSb.append("• 최근 동작 로그 (/data/local/tmp/usbwifi_hotspot) :\n");
-                int maxLogs = Math.min(4, snap.recentLogs.size());
+                setText.invoke(apTrafficTv, "⬇ " + formatBytes(snap.rxBytes) + "  /  ⬆ " + formatBytes(snap.txBytes));
+
+                // 4. Populate STA (Client) Mode Views
+                if (snap.staConnected) {
+                    setText.invoke(staConnBadgeTv, "● 연결됨 (" + snap.staBand + ")");
+                    setColor.invoke(staConnBadgeTv, 0xFF6EE7B7);
+                    setRoundedBg(staConnBadgeTv, 0x3310B981, 0x6634D399, 1, 12f);
+                    setText.invoke(staConnectedSsidTv, snap.staConnectedSsid);
+                    String ipDisp = snap.ifaceIp.isEmpty() ? "DHCP IP 할당 중..." : snap.ifaceIp;
+                    setText.invoke(staConnectedDetailTv,
+                            "• 신호 세기 : " + snap.staRssi + "\n"
+                                    + "• 할당 IP : " + ipDisp + "\n"
+                                    + "• 상태 : ✔ 외부 와이파이 수신 연결됨");
+                } else {
+                    setText.invoke(staConnBadgeTv, snap.staSsid.isEmpty() ? "⚪ 미연결" : "⏳ 연결 시도 중");
+                    setColor.invoke(staConnBadgeTv, 0xFFFCD34D);
+                    setRoundedBg(staConnBadgeTv, 0x33F59E0B, 0x66FBBF24, 1, 12f);
+                    setText.invoke(staConnectedSsidTv, snap.staSsid.isEmpty() ? "연결된 Wi-Fi 없음" : snap.staSsid);
+                    setText.invoke(staConnectedDetailTv,
+                            "• 상태 : " + (snap.staSsid.isEmpty() ? "우측 목록에서 Wi-Fi를 터치해 연결하세요" : "비밀번호 확인 또는 신호 검색 중...") + "\n"
+                                    + "• 인터페이스 : " + (snap.usbIface.isEmpty() ? "rtwlan0" : snap.usbIface));
+                }
+
+                for (int i = 0; i < 4; i++) {
+                    if (i < snap.staScanList.size()) {
+                        ScanEntry se = snap.staScanList.get(i);
+                        staScanRowSsids[i] = se.ssid;
+                        boolean isCur = snap.staConnected && se.ssid.equals(snap.staConnectedSsid);
+                        setText.invoke(staScanRowTitleTvs[i], "📶 " + se.ssid);
+                        setText.invoke(staScanRowSubTvs[i], isCur
+                                ? "✔ 현재 연결됨 · 터치하여 비밀번호 수정"
+                                : ("신호 (" + se.rssi + " dBm) · 터치하여 연결"));
+                        setColor.invoke(staScanRowSubTvs[i], isCur ? 0xFF34D399 : 0xFF94A3B8);
+                        setText.invoke(staScanRowBandTvs[i], se.band + (se.secured ? " 🔒" : ""));
+                        setRoundedBg(staScanRowViews[i], isCur ? 0xFF064E3B : 0xFF0F172A, isCur ? 0xFF10B981 : 0xFF334155, 1, 10f);
+                    } else {
+                        staScanRowSsids[i] = "";
+                        setText.invoke(staScanRowTitleTvs[i], i == 0 ? "📶 주변 Wi-Fi 검색 결과 대기 중..." : "➕ 직접 Wi-Fi 이름(SSID) 입력하기");
+                        setText.invoke(staScanRowSubTvs[i], i == 0 ? "상단 [🔄 다시 검색]을 누르거나 터치하여 직접 입력" : "터치하여 화면 키보드로 연결");
+                        setColor.invoke(staScanRowSubTvs[i], 0xFF64748B);
+                        setText.invoke(staScanRowBandTvs[i], "");
+                        setRoundedBg(staScanRowViews[i], 0xFF0F172A, 0xFF1E293B, 1, 10f);
+                    }
+                }
+
+                if (snap.savedStaList.isEmpty()) {
+                    setText.invoke(staSavedListTv, "저장된 Wi-Fi가 없습니다.\n\n한번 연결한 네트워크는 자동으로 기록됩니다.");
+                } else {
+                    StringBuilder ssb = new StringBuilder();
+                    int maxS = Math.min(4, snap.savedStaList.size());
+                    for (int i = 0; i < maxS; i++) {
+                        if (i > 0) ssb.append("\n\n");
+                        ssb.append(i + 1).append("순위: ").append(snap.savedStaList.get(i));
+                    }
+                    setText.invoke(staSavedListTv, ssb.toString());
+                }
+                setText.invoke(staTrafficTv, "⬇ 수신 데이터 : " + formatBytes(snap.rxBytes) + "\n⬆ 송신 데이터 : " + formatBytes(snap.txBytes));
+
+                // 5. Populate Expert View
+                String usbStr = snap.usbDonglePresent ? ("🟢 " + snap.usbDongleDesc) : "🔴 미연결";
+                String drvStr = snap.driverLoaded ? ("🟢 " + snap.driverModuleFile + " (" + snap.driverMemInfo + ")") : "🔴 미로드";
+                String ifaceStr = snap.usbIface.isEmpty() ? "⚪ 미생성" : ((snap.ifaceUp ? "🟢 " : "🟠 ") + snap.usbIface + " | IP: " + (snap.ifaceIp.isEmpty() ? "없음" : snap.ifaceIp));
+                String modeDesc = isStaMode ? "Client / STA (와이파이 수신 — wpa_supplicant)" : "AP (핫스팟 송출 — hostapd_usb + dnsmasq)";
+
+                StringBuilder leftSb = new StringBuilder(512);
+                leftSb.append("• 플랫폼/커널 : ").append(snap.platform).append(" (").append(snap.model).append(") | Linux ").append(snap.kernelRel).append("\n");
+                leftSb.append("• 동작 모드 : ").append(modeDesc).append("\n");
+                leftSb.append("• USB 랜카드 : ").append(usbStr).append("\n");
+                leftSb.append("• 드라이버 모듈 : ").append(drvStr).append("\n");
+                leftSb.append("• 인터페이스 : ").append(ifaceStr).append(" | 순정 wlan0 완벽 분리\n");
+                leftSb.append("• 백그라운드 데몬 : ").append(snap.daemonAlive ? ("🟢 PID " + snap.daemonPid) : "🔴 중지됨");
+
+                StringBuilder rightSb = new StringBuilder(512);
+                int maxLogs = Math.min(6, snap.recentLogs.size());
                 int startIdx = Math.max(0, snap.recentLogs.size() - maxLogs);
                 for (int i = startIdx; i < snap.recentLogs.size(); i++) {
-                    rightSb.append("   ").append(snap.recentLogs.get(i));
+                    rightSb.append(snap.recentLogs.get(i));
                     if (i + 1 < snap.recentLogs.size()) rightSb.append("\n");
                 }
 
-                Class<?> tvCls = Class.forName("android.widget.TextView");
-                Method setText = tvCls.getMethod("setText", CharSequence.class);
-                if (headerSysInfoTextView != null) {
-                    setText.invoke(headerSysInfoTextView, "  🖥 " + snap.platform + "  |  🌡 CPU: " + snap.cpuLoadPct + "%  |  " + snap.ramSummary + "  ");
-                }
+                setText.invoke(headerSysInfoTextView, "CPU " + snap.cpuLoadPct + "%  |  " + snap.ramSummary);
+                setText.invoke(subnetCycleBtn, "🌐 AP 서브넷: " + snap.forceSubnet);
                 setText.invoke(leftColTextView, leftSb.toString());
                 setText.invoke(rightColTextView, rightSb.toString());
+
+                // 6. Footer Status & Timer
                 long remainClose = Math.max(1L, 90L - elapsedSec);
-                setText.invoke(footerStatusTextView, actionBannerMsg + "  (" + remainClose + "초 후 자동 닫힘)");
+                setText.invoke(footerStatusTextView, actionBannerMsg);
+                setText.invoke(footerTimerTextView, "자동 닫힘: " + remainClose + "초 후  |  v" + UI_VERSION);
             } catch (Throwable ignored) {
             }
         }
 
+        private static void openEditModalOnUi(String target) {
+            SystemSnapshot snap = latestSnapshot;
+            if ("sta_manual".equals(target)) {
+                modalContext = "sta";
+                editingSsid = (snap != null && !snap.staSsid.isEmpty()) ? snap.staSsid : "";
+                editingPass = (snap != null && !snap.staPass.isEmpty()) ? snap.staPass : "";
+                activeEditField = "ssid";
+            } else {
+                modalContext = "ap";
+                editingSsid = (snap != null && !snap.apSsid.isEmpty()) ? snap.apSsid : "HKG_USB_Hotspot";
+                editingPass = (snap != null && !snap.apPass.isEmpty()) ? snap.apPass : "12345678";
+                activeEditField = "ap_pass".equals(target) ? "pass" : "ssid";
+            }
+            isEditModalOpen = true;
+            shownAtMs = System.currentTimeMillis();
+            postToUi(REFRESH_TASK);
+        }
+
+        private static void openStaConnectModalOnUi(String targetSsid) {
+            SystemSnapshot snap = latestSnapshot;
+            modalContext = "sta";
+            editingSsid = targetSsid;
+            editingPass = (snap != null && targetSsid.equals(snap.staSsid) && !snap.staPass.isEmpty())
+                    ? snap.staPass
+                    : lookupSavedStaPassword(targetSsid);
+            activeEditField = "pass";
+            isEditModalOpen = true;
+            shownAtMs = System.currentTimeMillis();
+            postToUi(REFRESH_TASK);
+        }
+
+        private static String lookupSavedStaPassword(String ssid) {
+            if (ssid == null || ssid.isEmpty()) return "";
+            File savedFile = new File(installDir, "config/saved_sta.conf");
+            if (!savedFile.isFile()) return "";
+            List<String> lines = readLinesQuick(savedFile, 30);
+            for (String l : lines) {
+                int eq = l.indexOf('=');
+                if (eq > 0) {
+                    String k = l.substring(0, eq).trim();
+                    String v = l.substring(eq + 1).trim();
+                    if (ssid.equals(k)) return v;
+                }
+            }
+            return "";
+        }
+
+        private static void saveStaNetworkToHistory(String ssid, String pass) {
+            try {
+                File savedFile = new File(installDir, "config/saved_sta.conf");
+                List<String> existing = savedFile.isFile() ? readLinesQuick(savedFile, 30) : new ArrayList<String>();
+                List<String> updated = new ArrayList<String>();
+                updated.add(ssid + "=" + pass);
+                for (String l : existing) {
+                    int eq = l.indexOf('=');
+                    String k = (eq > 0 ? l.substring(0, eq) : l).trim();
+                    if (!k.isEmpty() && !k.equals(ssid) && updated.size() < 8) {
+                        updated.add(l.trim());
+                    }
+                }
+                StringBuilder sb = new StringBuilder();
+                for (String u : updated) {
+                    sb.append(u).append('\n');
+                }
+                writeBytesAtomic(savedFile, sb.toString().getBytes(UTF8));
+            } catch (Throwable ignored) {
+            }
+        }
+
+        private static void refreshKeyboardCaseOnUi() {
+            try {
+                Class<?> tvCls = Class.forName("android.widget.TextView");
+                Method setText = tvCls.getMethod("setText", CharSequence.class);
+                if (kbShiftBtn != null) {
+                    setText.invoke(kbShiftBtn, kbUpper ? "⬆ 대문자" : "⬇ 소문자");
+                    setRoundedBg(kbShiftBtn, kbUpper ? 0xFF0284C7 : 0xFF334155, kbUpper ? 0xFF38BDF8 : 0xFF64748B, 1, 12f);
+                }
+                for (int i = 0; i < kbLetterBtns.size(); i++) {
+                    String base = kbLetterBaseChars.get(i);
+                    setText.invoke(kbLetterBtns.get(i), kbUpper ? base : base.toLowerCase(Locale.US));
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        private static void pressKeyOnUi(String ch) {
+            if ("ssid".equals(activeEditField)) {
+                if (editingSsid.length() < 32) {
+                    editingSsid = editingSsid + ch;
+                }
+            } else {
+                if (editingPass.length() < 63) {
+                    editingPass = editingPass + ch;
+                }
+            }
+            refreshModalInputsOnUi();
+        }
+
+        private static void pressBackspaceOnUi() {
+            if ("ssid".equals(activeEditField)) {
+                if (editingSsid.length() > 0) {
+                    editingSsid = editingSsid.substring(0, editingSsid.length() - 1);
+                }
+            } else {
+                if (editingPass.length() > 0) {
+                    editingPass = editingPass.substring(0, editingPass.length() - 1);
+                }
+            }
+            refreshModalInputsOnUi();
+        }
+
+        private static void refreshModalInputsOnUi() {
+            try {
+                Class<?> tvCls = Class.forName("android.widget.TextView");
+                Method setText = tvCls.getMethod("setText", CharSequence.class);
+                Method setColor = tvCls.getMethod("setTextColor", int.class);
+
+                boolean isSta = "sta".equals(modalContext);
+                setText.invoke(modalTitleTv, isSta
+                        ? "✏️ 외부 Wi-Fi 네트워크 연결 설정"
+                        : "✏️ 내 차량 핫스팟 이름(SSID) · 비밀번호 변경");
+                setText.invoke(modalSaveBtn, isSta ? "✔ 이 Wi-Fi에 연결하기" : "✔ 저장 및 적용");
+
+                if ("ssid".equals(activeEditField)) {
+                    setRoundedBg(modalSsidFieldBox, 0xFF0F172A, 0xFF38BDF8, 2, 12f);
+                    setRoundedBg(modalPassFieldBox, 0xFF0F172A, 0xFF334155, 2, 12f);
+                } else {
+                    setRoundedBg(modalSsidFieldBox, 0xFF0F172A, 0xFF334155, 2, 12f);
+                    setRoundedBg(modalPassFieldBox, 0xFF0F172A, 0xFFFBBF24, 2, 12f);
+                }
+
+                String sTrim = editingSsid.trim();
+                boolean ssidOk = sTrim.length() >= 1 && sTrim.length() <= 32;
+                boolean passOk = editingPass.length() >= 8 && editingPass.length() <= 63;
+
+                setText.invoke(modalSsidValueTv, editingSsid.isEmpty() ? "(이름을 입력하세요)" : editingSsid);
+                setColor.invoke(modalSsidValueTv, editingSsid.isEmpty() ? 0xFF64748B : 0xFFFFFFFF);
+                setText.invoke(modalSsidLenTv, sTrim.length() + " / 32자");
+
+                setText.invoke(modalPassValueTv, editingPass.isEmpty() ? "(비밀번호 8자 이상)" : editingPass);
+                setColor.invoke(modalPassValueTv, editingPass.isEmpty() ? 0xFF64748B : 0xFFFCD34D);
+                if (passOk) {
+                    setText.invoke(modalPassLenTv, "✔ " + editingPass.length() + "자 가능");
+                    setColor.invoke(modalPassLenTv, 0xFF34D399);
+                } else {
+                    setText.invoke(modalPassLenTv, "⚠ " + editingPass.length() + "자 (8자 이상)");
+                    setColor.invoke(modalPassLenTv, 0xFFFDA4AF);
+                }
+
+                if (ssidOk && passOk) {
+                    setText.invoke(modalValidationTv, isSta
+                            ? "  ✔ [연결하기]를 누르면 해당 Wi-Fi에 접속합니다"
+                            : "  ✔ 우측 키보드로 입력 후 [저장 및 적용]을 누르세요");
+                    setColor.invoke(modalValidationTv, 0xFF34D399);
+                    setRoundedBg(modalSaveBtn, 0xFF059669, 0xFF34D399, 1, 10f);
+                } else {
+                    setText.invoke(modalValidationTv, !ssidOk
+                            ? "  ⚠ 와이파이 이름(SSID)을 1자 이상 입력해 주세요"
+                            : "  ⚠ 비밀번호는 8자리 이상 입력해야 합니다");
+                    setColor.invoke(modalValidationTv, 0xFFFDA4AF);
+                    setRoundedBg(modalSaveBtn, 0xFF334155, 0xFF475569, 1, 10f);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        private static void saveModalAndApplyOnUi() {
+            final String newSsid = editingSsid.trim();
+            final String newPass = editingPass;
+            if (newSsid.length() < 1 || newSsid.length() > 32 || newPass.length() < 8 || newPass.length() > 63) {
+                return;
+            }
+            final boolean isSta = "sta".equals(modalContext);
+            isEditModalOpen = false;
+            actionBannerMsg = isSta
+                    ? ("📶 외부 Wi-Fi [" + newSsid + "]에 연결을 요청하고 있습니다...")
+                    : ("✅ 새 핫스팟 설정([" + newSsid + "])을 저장하고 신호를 재시작합니다...");
+            postToUi(REFRESH_TASK);
+
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        File confFile = new File(installDir, "config/hotspot.conf");
+                        if (isSta) {
+                            updateConfigKeys(confFile, new String[][]{
+                                    {"WIFI_MODE", "sta"},
+                                    {"STA_SSID", newSsid},
+                                    {"STA_PASS", newPass}
+                            });
+                            saveStaNetworkToHistory(newSsid, newPass);
+                        } else {
+                            updateConfigKeys(confFile, new String[][]{
+                                    {"WIFI_MODE", "ap"},
+                                    {"AP_SSID", newSsid},
+                                    {"AP_PASS", newPass}
+                            });
+                        }
+                        writeBytesAtomic(new File(TMP_DIR_PATH, "force_restart"), "1\n".getBytes(UTF8));
+                        latestSnapshot = collectSnapshot(installDir);
+                    } catch (Throwable t) {
+                        actionBannerMsg = "⚠️ 설정 저장 실패: " + t.getMessage();
+                    }
+                    postToUi(REFRESH_TASK);
+                }
+            }, "SaveModalConfigThread").start();
+        }
+
+        private static void switchWifiModeFromUi(final String targetMode) {
+            isExpertView = false;
+            actionBannerMsg = "sta".equals(targetMode)
+                    ? "📶 [와이파이 수신 모드(Client)]로 전환 중입니다..."
+                    : "📡 [핫스팟 모드(AP)]로 전환 중입니다...";
+            postToUi(REFRESH_TASK);
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        File confFile = new File(installDir, "config/hotspot.conf");
+                        updateConfigKeys(confFile, new String[][]{
+                                {"WIFI_MODE", targetMode}
+                        });
+                        writeBytesAtomic(new File(TMP_DIR_PATH, "force_restart"), "1\n".getBytes(UTF8));
+                        latestSnapshot = collectSnapshot(installDir);
+                    } catch (Throwable t) {
+                        actionBannerMsg = "⚠️ 모드 전환 실패: " + t.getMessage();
+                    }
+                    postToUi(REFRESH_TASK);
+                }
+            }, "SwitchWifiModeThread").start();
+        }
+
+        private static void selectBandFromUi(final String targetHwMode) {
+            final String nextChan = "a".equalsIgnoreCase(targetHwMode) ? "149" : "6";
+            String label = "a".equalsIgnoreCase(targetHwMode) ? "5GHz 고속 (Ch 149)" : "2.4GHz 일반 (Ch 6)";
+            actionBannerMsg = "📻 송출 주파수를 [" + label + "]로 변경하고 재시작합니다...";
+            postToUi(REFRESH_TASK);
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        File confFile = new File(installDir, "config/hotspot.conf");
+                        updateConfigKeys(confFile, new String[][]{
+                                {"AP_HW_MODE", targetHwMode},
+                                {"AP_CHANNEL", nextChan}
+                        });
+                        writeBytesAtomic(new File(TMP_DIR_PATH, "force_restart"), "1\n".getBytes(UTF8));
+                        latestSnapshot = collectSnapshot(installDir);
+                    } catch (Throwable t) {
+                        actionBannerMsg = "⚠️ 주파수 변경 실패: " + t.getMessage();
+                    }
+                    postToUi(REFRESH_TASK);
+                }
+            }, "SelectBandThread").start();
+        }
+
+        private static void triggerStaScanFromUi() {
+            actionBannerMsg = "🔄 주변 Wi-Fi 네트워크를 다시 검색하고 있습니다...";
+            postToUi(REFRESH_TASK);
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        writeBytesAtomic(new File(TMP_DIR_PATH, "trigger_scan"), "1\n".getBytes(UTF8));
+                        Thread.sleep(2500L);
+                        latestSnapshot = collectSnapshot(installDir);
+                        actionBannerMsg = "✅ 주변 Wi-Fi 검색 완료! 연결할 네트워크를 터치하세요.";
+                    } catch (Throwable ignored) {
+                    }
+                    postToUi(REFRESH_TASK);
+                }
+            }, "StaScanTrigger").start();
+        }
+
+        private static void disconnectStaFromUi() {
+            actionBannerMsg = "🔌 현재 외부 Wi-Fi 연결을 해제합니다...";
+            postToUi(REFRESH_TASK);
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        File confFile = new File(installDir, "config/hotspot.conf");
+                        updateConfigKeys(confFile, new String[][]{
+                                {"STA_SSID", ""},
+                                {"STA_PASS", ""}
+                        });
+                        writeBytesAtomic(new File(TMP_DIR_PATH, "disconnect_sta"), "1\n".getBytes(UTF8));
+                        Thread.sleep(1000L);
+                        latestSnapshot = collectSnapshot(installDir);
+                        actionBannerMsg = "🔌 외부 Wi-Fi 연결이 해제되었습니다.";
+                    } catch (Throwable ignored) {
+                    }
+                    postToUi(REFRESH_TASK);
+                }
+            }, "DisconnectStaThread").start();
+        }
+
         private static void triggerRestartHotspotFromUi() {
-            actionBannerMsg = "⏳ USB Wi-Fi 핫스팟(hostapd / dnsmasq) 재시작 요청 중...";
+            actionBannerMsg = "⏳ 무선랜 서비스를 재시작하고 있습니다...";
             postToUi(REFRESH_TASK);
             new Thread(new Runnable() {
                 @Override
@@ -1127,7 +2483,6 @@ public class UsbWifiStatusMain {
                         File tmpDir = new File(TMP_DIR_PATH);
                         if (!tmpDir.exists()) tmpDir.mkdirs();
                         writeBytesAtomic(new File(tmpDir, "force_restart"), "1\n".getBytes(UTF8));
-                        // Also ensure daemon is running
                         String dpid = readFirstLineQuick(new File(tmpDir, "daemon.pid"));
                         if (!isProcessAlive(dpid)) {
                             File daemonSh = new File(installDir, "svc/usbwifi-hotspot-daemon.sh");
@@ -1136,38 +2491,13 @@ public class UsbWifiStatusMain {
                             }
                         }
                         Thread.sleep(1500L);
-                        actionBannerMsg = "✅ 핫스팟 재시작 명령 전달 완료! (잠시 후 상태가 갱신됩니다)";
+                        actionBannerMsg = "✅ 재시작 명령 전달 완료! (잠시 후 상태가 갱신됩니다)";
                     } catch (Throwable t) {
                         actionBannerMsg = "⚠️ 재시작 요청 오류: " + t.getMessage();
                     }
                     postToUi(REFRESH_TASK);
                 }
             }, "RestartHotspotTrigger").start();
-        }
-
-        private static void toggleBandFromUi() {
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        File confFile = new File(installDir, "config/hotspot.conf");
-                        Map<String, String> conf = parseKeyValueFile(confFile);
-                        String curMode = stripQuotes(getOrDefault(conf, "AP_HW_MODE", "g"));
-                        String nextMode = "a".equalsIgnoreCase(curMode) ? "g" : "a";
-                        String nextChan = "a".equalsIgnoreCase(nextMode) ? "149" : "6";
-                        updateConfigKeys(confFile, new String[][]{
-                                {"AP_HW_MODE", nextMode},
-                                {"AP_CHANNEL", nextChan}
-                        });
-                        writeBytesAtomic(new File(TMP_DIR_PATH, "force_restart"), "1\n".getBytes(UTF8));
-                        String label = "a".equals(nextMode) ? "5GHz (Ch 149)" : "2.4GHz (Ch 6)";
-                        actionBannerMsg = "✅ 무선 주파수를 [" + label + "]로 변경하고 AP를 재시작합니다.";
-                    } catch (Throwable t) {
-                        actionBannerMsg = "⚠️ 대역 변경 실패: " + t.getMessage();
-                    }
-                    postToUi(REFRESH_TASK);
-                }
-            }, "ToggleBandThread").start();
         }
 
         private static void toggleSubnetFromUi() {
