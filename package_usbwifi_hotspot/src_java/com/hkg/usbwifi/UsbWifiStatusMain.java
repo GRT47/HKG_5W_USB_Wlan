@@ -43,9 +43,9 @@ import javax.net.ssl.X509TrustManager;
  * Renders a live 2-column system overlay window on the head unit screen showing:
  *  - Platform / Board / Kernel info (tcc803x / tcc897x)
  *  - Background Daemon status (PID / running state)
- *  - USB Dongle (0bda:b812 Realtek RTL8812BU) connection, USB bus path & link speed
- *  - Kernel Module (88x2bu.ko / 88x2bu_tcc897x.ko) load state, memory size & insmod logs
- *  - USB Wi-Fi Network Interface (wlan1 / wlan0) UP/DOWN state, IPv4/prefix, MAC, RX/TX traffic
+ *  - USB Dongle (Realtek RTL8812BU/8822BU 0bda:b812 & RTL8831BU/8851BU 0bda:b831/b851) connection, USB bus path & link speed
+ *  - Kernel Module (88x2bu*.ko / 8851bu*.ko) load state, memory size & insmod logs
+ *  - USB Wi-Fi Network Interface (rtwlan0 / wlan1 / wlan0) UP/DOWN state, IPv4/prefix, MAC, RX/TX traffic
  *  - Built-in Wi-Fi (bcmdhd / wlan0) coexistence status
  *  - SoftAP (hostapd) & DHCP (dnsmasq) state, SSID, password, band/channel, connected clients
  *  - Live tail of daemon.log & hostapd.log
@@ -53,13 +53,61 @@ import javax.net.ssl.X509TrustManager;
  */
 public class UsbWifiStatusMain {
 
-    public static final String UI_VERSION = "1.9.0";
+    public static final String UI_VERSION = "2.0.0";
     public static final String GITHUB_RAW_HOST = "raw.githubusercontent.com";
     public static final String GITHUB_OTA_BASE_PATH = "/GRT47/HKG_5W_USB_Wlan/main/ota";
     private static final Charset UTF8 = Charset.forName("UTF-8");
 
     private static final String TMP_DIR_PATH = "/data/local/tmp/usbwifi_hotspot";
     private static final String WIFI_WORK_DIR_PATH = "/data/misc/wifi/usbwifi_hotspot";
+
+    public static String classifyUsbWifiDongle(String vid, String pid, String confVid, String confPid) {
+        if (vid == null || pid == null) return null;
+        String v = vid.trim().toLowerCase(Locale.US);
+        String p = pid.trim().toLowerCase(Locale.US);
+        String vp = v + ":" + p;
+        // 1. Realtek RTL8831BU / RTL8851BU (AX900 Wi-Fi 6)
+        if ("0bda:b831".equals(vp)) return "RTL8831BU Wi-Fi 6";
+        if ("0bda:b851".equals(vp) || "0bda:b832".equals(vp)) return "RTL8851BU Wi-Fi 6";
+        if ("3625:010b".equals(vp) || "2357:0142".equals(vp)) return "TP-Link RTL8831BU/8851BU";
+        if ("7392:e611".equals(vp)) return "Edimax RTL8851BU";
+        if ("2001:332a".equals(vp)) return "D-Link RTL8851BU";
+        if ("2c4e:0128".equals(vp)) return "Mercusys RTL8851BU";
+        if ("056e:4027".equals(vp) || "056e:4028".equals(vp)) return "Elecom RTL8851BU";
+        if ("0411:03ed".equals(vp)) return "Buffalo RTL8851BU";
+        // 2. Realtek RTL8812BU / RTL8822BU (802.11ac)
+        if ("0bda:b812".equals(vp)) return "RTL8812BU";
+        if ("0bda:b82c".equals(vp) || "0bda:b81a".equals(vp) || "0bda:b820".equals(vp) || "0bda:b82b".equals(vp)) {
+            return "RTL8822BU";
+        }
+        if ("2357:012d".equals(vp) || "2357:0138".equals(vp) || "2357:0115".equals(vp)
+                || "7392:b822".equals(vp) || "7392:c822".equals(vp)
+                || "0b05:184c".equals(vp) || "0b05:1841".equals(vp)
+                || "2001:331c".equals(vp) || "2001:331e".equals(vp)
+                || "0846:9055".equals(vp) || "13b1:0043".equals(vp)
+                || "0e66:0025".equals(vp) || "0411:029b".equals(vp) || "056e:4011".equals(vp)) {
+            return "RTL88x2BU";
+        }
+        // 3. Realtek Virtual CD-ROM Auto-Install mode (auto-switching to Wi-Fi mode)
+        if ("0bda:1a2b".equals(vp)) return "Realtek CD-ROM 자동전환 중";
+        // 4. Custom configured VID:PID in hotspot.conf
+        if (confVid != null && confPid != null
+                && v.equals(confVid.trim().toLowerCase(Locale.US))
+                && p.equals(confPid.trim().toLowerCase(Locale.US))) {
+            return "USB Wi-Fi";
+        }
+        return null;
+    }
+
+    public static boolean is8851buDongle(String vid, String pid) {
+        if (vid == null || pid == null) return false;
+        String vp = vid.trim().toLowerCase(Locale.US) + ":" + pid.trim().toLowerCase(Locale.US);
+        return "0bda:b831".equals(vp) || "0bda:b851".equals(vp) || "0bda:b832".equals(vp)
+                || "3625:010b".equals(vp) || "2357:0142".equals(vp) || "7392:e611".equals(vp)
+                || "2001:332a".equals(vp) || "2c4e:0128".equals(vp)
+                || "056e:4027".equals(vp) || "056e:4028".equals(vp) || "0411:03ed".equals(vp)
+                || "0bda:1a2b".equals(vp);
+    }
 
     public static final class ScanEntry {
         public String ssid = "";
@@ -193,6 +241,7 @@ public class UsbWifiStatusMain {
         File usbBusDir = new File("/sys/bus/usb/devices");
         File[] usbDevs = usbBusDir.listFiles();
         List<String> otherList = new ArrayList<String>();
+        boolean activeDongleIs8851bu = false;
         if (usbDevs != null) {
             for (File d : usbDevs) {
                 File vidF = new File(d, "idVendor");
@@ -206,9 +255,13 @@ public class UsbWifiStatusMain {
                 String prod = readFirstLineQuick(new File(d, "product"));
                 String speed = readFirstLineQuick(new File(d, "speed"));
                 String busName = d.getName();
-                if (v.equals(targetVid) && p.equals(targetPid)) {
+                String chipModel = classifyUsbWifiDongle(v, p, targetVid, targetPid);
+                if (chipModel != null) {
                     snap.usbDonglePresent = true;
-                    String label = prod.isEmpty() ? ("RTL88x2BU (" + v + ":" + p + ")") : prod;
+                    if (is8851buDongle(v, p)) {
+                        activeDongleIs8851bu = true;
+                    }
+                    String label = prod.isEmpty() ? (chipModel + " (" + v + ":" + p + ")") : (prod + " [" + chipModel + ", " + v + ":" + p + "]");
                     snap.usbDongleDesc = label + " [포트: " + busName + (speed.isEmpty() ? "" : ", " + speed + "Mbps") + "]";
                 } else {
                     String oLabel = prod.isEmpty() ? (v + ":" + p) : (prod + "(" + v + ":" + p + ")");
@@ -227,24 +280,61 @@ public class UsbWifiStatusMain {
             snap.otherUsbDevices = osb.toString();
         }
 
-        // 3. Kernel module (88x2bu) check in /proc/modules
+        // 3. Kernel module (88x2bu / 8851bu) check in /proc/modules
         File modDir = new File(installDir, "modules");
-        File platKo = new File(modDir, "88x2bu_" + snap.platform + ".ko");
-        snap.driverModuleFile = platKo.isFile() ? platKo.getName() : "88x2bu.ko";
+        String baseDrv = activeDongleIs8851bu ? "8851bu" : "88x2bu";
+        File platKo = new File(modDir, baseDrv + "_" + snap.platform + ".ko");
+        snap.driverModuleFile = platKo.isFile() ? platKo.getName() : (baseDrv + ".ko");
 
         List<String> modLines = readLinesQuick(new File("/proc/modules"), 200);
+        boolean loaded88x2 = false;
+        boolean loaded8851 = false;
+        String mem88x2 = "";
+        String mem8851 = "";
         for (String line : modLines) {
             if (line.startsWith("88x2bu ")) {
-                snap.driverLoaded = true;
+                loaded88x2 = true;
                 String[] parts = line.split("\\s+");
                 if (parts.length >= 3) {
                     long bytes = parseLongSafe(parts[1], 0L);
                     String mbStr = String.format(Locale.US, "%.2fMB", bytes / (1024.0 * 1024.0));
-                    snap.driverMemInfo = mbStr + ", ref=" + parts[2];
+                    mem88x2 = mbStr + ", ref=" + parts[2];
+                }
+            } else if (line.startsWith("8851bu ")) {
+                loaded8851 = true;
+                String[] parts = line.split("\\s+");
+                if (parts.length >= 3) {
+                    long bytes = parseLongSafe(parts[1], 0L);
+                    String mbStr = String.format(Locale.US, "%.2fMB", bytes / (1024.0 * 1024.0));
+                    mem8851 = mbStr + ", ref=" + parts[2];
                 }
             } else if (line.startsWith("bcmdhd ")) {
                 snap.hasBuiltinBcmdhd = true;
             }
+        }
+        if (activeDongleIs8851bu && loaded8851) {
+            snap.driverLoaded = true;
+            File ko51 = new File(modDir, "8851bu_" + snap.platform + ".ko");
+            snap.driverModuleFile = ko51.isFile() ? ko51.getName() : "8851bu.ko";
+            snap.driverMemInfo = mem8851;
+        } else if (!activeDongleIs8851bu && loaded88x2) {
+            snap.driverLoaded = true;
+            File ko82 = new File(modDir, "88x2bu_" + snap.platform + ".ko");
+            snap.driverModuleFile = ko82.isFile() ? ko82.getName() : "88x2bu.ko";
+            snap.driverMemInfo = mem88x2;
+        } else if (loaded8851) {
+            snap.driverLoaded = true;
+            File ko51 = new File(modDir, "8851bu_" + snap.platform + ".ko");
+            snap.driverModuleFile = ko51.isFile() ? ko51.getName() : "8851bu.ko";
+            snap.driverMemInfo = mem8851;
+        } else if (loaded88x2) {
+            snap.driverLoaded = true;
+            File ko82 = new File(modDir, "88x2bu_" + snap.platform + ".ko");
+            snap.driverModuleFile = ko82.isFile() ? ko82.getName() : "88x2bu.ko";
+            snap.driverMemInfo = mem88x2;
+        }
+        if (loaded88x2 && loaded8851) {
+            snap.driverModuleFile = snap.driverModuleFile + " (+듀얼모듈)";
         }
         if (!snap.hasBuiltinBcmdhd) {
             if (new File("/system/wifi/bcmdhd.ko").isFile()
@@ -421,6 +511,7 @@ public class UsbWifiStatusMain {
         if (!snap.staConnected) {
             File[] apInfoFiles = new File[]{
                     !snap.usbIface.isEmpty() ? new File("/proc/net/rtl88x2bu/" + snap.usbIface + "/ap_info") : new File(tmpDir, "sta_ap_info.txt"),
+                    !snap.usbIface.isEmpty() ? new File("/proc/net/rtl8851bu/" + snap.usbIface + "/ap_info") : new File(tmpDir, "sta_ap_info.txt"),
                     new File(tmpDir, "sta_ap_info.txt")
             };
             for (File aif : apInfoFiles) {
@@ -455,6 +546,7 @@ public class UsbWifiStatusMain {
         if ("-- dBm".equals(snap.staRssi)) {
             File[] rxSigFiles = new File[]{
                     !snap.usbIface.isEmpty() ? new File("/proc/net/rtl88x2bu/" + snap.usbIface + "/rx_signal") : new File(tmpDir, "sta_rx_signal.txt"),
+                    !snap.usbIface.isEmpty() ? new File("/proc/net/rtl8851bu/" + snap.usbIface + "/rx_signal") : new File(tmpDir, "sta_rx_signal.txt"),
                     new File(tmpDir, "sta_rx_signal.txt")
             };
             for (File rxf : rxSigFiles) {
@@ -507,6 +599,7 @@ public class UsbWifiStatusMain {
         }
         File[] surveyFiles = new File[]{
                 !snap.usbIface.isEmpty() ? new File("/proc/net/rtl88x2bu/" + snap.usbIface + "/survey_info") : new File(tmpDir, "sta_survey.txt"),
+                !snap.usbIface.isEmpty() ? new File("/proc/net/rtl8851bu/" + snap.usbIface + "/survey_info") : new File(tmpDir, "sta_survey.txt"),
                 new File(tmpDir, "sta_survey.txt")
         };
         for (File svf : surveyFiles) {
@@ -620,7 +713,7 @@ public class UsbWifiStatusMain {
                 String combined = canonNet + " " + canonDev + " " + canonDrv;
                 if (combined.contains("usb") || combined.contains("dwc_otg")
                         || combined.contains("ehci") || combined.contains("ohci")
-                        || combined.contains("88x2bu")) {
+                        || combined.contains("88x2bu") || combined.contains("8851bu")) {
                     return ifname;
                 }
             } catch (Throwable ignored) {
@@ -4450,7 +4543,24 @@ public class UsbWifiStatusMain {
             throw new AssertionError("MAP short-to-long handoff at 3.0s must trigger dashboard");
         }
 
-        System.out.println("USBWIFI STATUS UI SELF-TEST PASSED! (" + compact + ", mapHoldTests=OK)");
+        // 5) RTL8831BU / RTL8851BU / RTL8812BU / 0bda:1a2b USB dongle classification tests
+        if (!"RTL8831BU Wi-Fi 6".equals(classifyUsbWifiDongle("0bda", "b831", "0bda", "b812")) || !is8851buDongle("0bda", "b831")) {
+            throw new AssertionError("RTL8831BU (0bda:b831) classification failed");
+        }
+        if (!"RTL8851BU Wi-Fi 6".equals(classifyUsbWifiDongle("0bda", "b851", "0bda", "b812")) || !is8851buDongle("0bda", "b851")) {
+            throw new AssertionError("RTL8851BU (0bda:b851) classification failed");
+        }
+        if (!"TP-Link RTL8831BU/8851BU".equals(classifyUsbWifiDongle("3625", "010b", "0bda", "b812")) || !is8851buDongle("3625", "010b")) {
+            throw new AssertionError("TP-Link RTL8851BU (3625:010b) classification failed");
+        }
+        if (!"Realtek CD-ROM 자동전환 중".equals(classifyUsbWifiDongle("0bda", "1a2b", "0bda", "b812")) || !is8851buDongle("0bda", "1a2b")) {
+            throw new AssertionError("Realtek CD-ROM (0bda:1a2b) classification failed");
+        }
+        if (!"RTL8812BU".equals(classifyUsbWifiDongle("0bda", "b812", "0bda", "b812")) || is8851buDongle("0bda", "b812")) {
+            throw new AssertionError("RTL8812BU (0bda:b812) classification failed");
+        }
+
+        System.out.println("USBWIFI STATUS UI SELF-TEST PASSED! (" + compact + ", mapHoldTests=OK, rtl8831buTests=OK)");
         return 0;
     }
 

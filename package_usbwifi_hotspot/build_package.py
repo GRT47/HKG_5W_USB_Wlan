@@ -3,7 +3,9 @@
 
 Target Hardware:
 - Head Unit: HKG Standard Gen5W (Telechips TCC803x / TCC897x, Linux 3.18.24-tcc SMP PREEMPT ARMv7, Android 4.4.2)
-- USB Wi-Fi NIC: Realtek RTL8812BU 802.11ac USB NIC (VID: 0x0BDA, PID: 0xB812, module: 88x2bu.ko / 88x2bu_tcc897x.ko)
+- USB Wi-Fi NICs:
+  * Realtek RTL8812BU / RTL8822BU 802.11ac USB NIC (0bda:b812, 0bda:b82c, etc. -> 88x2bu.ko / 88x2bu_tcc897x.ko)
+  * Realtek RTL8831BU / RTL8851BU 802.11ax Wi-Fi 6 USB NIC (0bda:b831, 0bda:b851, 0bda:1a2b auto-modeswitch -> 8851bu.ko / 8851bu_tcc897x.ko)
 - On-Screen Status UI: com.hkg.usbwifi.UsbWifiStatusMain (DEX 035 JAR -> bin/usbwifistatus.jar)
 """
 from __future__ import annotations
@@ -13,6 +15,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import zipfile
 from pathlib import Path
@@ -118,6 +121,95 @@ def build_status_ui_jar() -> Path:
         zf.writestr(zinfo, dex_bytes)
 
     return jar_path
+
+
+def parse_elf32_ko(ko_path: Path) -> tuple[set[str], dict[str, list[str]], int]:
+    data = ko_path.read_bytes()
+    if data[:4] != b"\x7fELF" or data[4] != 1:
+        raise RuntimeError(f"{ko_path.name} is not a 32-bit ELF binary")
+    e_shoff, _, _, _, e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<IIIHHHH", data, 32)
+    sections = []
+    for i in range(e_shnum):
+        off = e_shoff + i * e_shentsize
+        sections.append(struct.unpack_from("<IIIIIIIIII", data, off))
+    shstr_off, shstr_size = sections[e_shstrndx][4], sections[e_shstrndx][5]
+    shstr = data[shstr_off : shstr_off + shstr_size]
+
+    sec_by_name = {}
+    for sh in sections:
+        name_end = shstr.find(b"\x00", sh[0])
+        name = shstr[sh[0] : name_end].decode("ascii", errors="ignore")
+        sec_by_name[name] = sh
+
+    undef_syms: set[str] = set()
+    if ".symtab" in sec_by_name and ".strtab" in sec_by_name:
+        sym_sh = sec_by_name[".symtab"]
+        str_sh = sec_by_name[".strtab"]
+        strtab = data[str_sh[4] : str_sh[4] + str_sh[5]]
+        sym_off, sym_size, sym_entsize = sym_sh[4], sym_sh[5], sym_sh[9] or 16
+        for pos in range(sym_off, sym_off + sym_size, sym_entsize):
+            st_name, _, _, st_info, _, st_shndx = struct.unpack_from("<IIIBBH", data, pos)
+            if st_shndx == 0 and st_name != 0:
+                end = strtab.find(b"\x00", st_name)
+                sname = strtab[st_name:end].decode("ascii", errors="ignore")
+                if sname:
+                    undef_syms.add(sname)
+
+    modinfo: dict[str, list[str]] = {}
+    if ".modinfo" in sec_by_name:
+        mi_sh = sec_by_name[".modinfo"]
+        raw_mi = data[mi_sh[4] : mi_sh[4] + mi_sh[5]]
+        for item in raw_mi.split(b"\x00"):
+            if b"=" in item:
+                k, v = item.decode("ascii", errors="ignore").split("=", 1)
+                modinfo.setdefault(k, []).append(v)
+
+    this_mod_size = sec_by_name[".gnu.linkonce.this_module"][5] if ".gnu.linkonce.this_module" in sec_by_name else 0
+    return undef_syms, modinfo, this_mod_size
+
+
+def verify_kernel_modules(pkg_mod_dir: Path) -> None:
+    expected = {
+        "88x2bu.ko": (0x154, ["usbwifi_kernel_dump_ev6", "usbwifi_kernel_dump_ioniq5", "usbwifi_kernel_dump_k8hev"]),
+        "88x2bu_tcc897x.ko": (0x154, ["usbwifi_kernel_dump_niroev"]),
+        "8851bu.ko": (0x154, ["usbwifi_kernel_dump_ev6", "usbwifi_kernel_dump_ioniq5", "usbwifi_kernel_dump_k8hev"]),
+        "8851bu_tcc897x.ko": (0x154, ["usbwifi_kernel_dump_niroev"]),
+    }
+    dump_root = BASE_DIR.parent / "log" / "usbwifi_kernel_dump"
+    vehicle_ksyms: dict[str, set[str]] = {}
+    if dump_root.is_dir():
+        for kfile in sorted(dump_root.glob("usbwifi_kernel_dump_*/kernel/kallsyms.txt")):
+            vname = kfile.parent.parent.name
+            syms = set()
+            for line in kfile.read_text(encoding="utf-8", errors="ignore").splitlines():
+                parts = line.split()
+                if len(parts) >= 3:
+                    syms.add(parts[2])
+            vehicle_ksyms[vname] = syms
+
+    for ko_name, (exp_mod_size, target_vehicles) in expected.items():
+        ko_path = pkg_mod_dir / ko_name
+        if not ko_path.is_file():
+            raise RuntimeError(f"Missing required kernel module: {ko_path}")
+        undef_syms, modinfo, this_mod_size = parse_elf32_ko(ko_path)
+        vermagic = (modinfo.get("vermagic") or [""])[0]
+        if vermagic != "3.18.24-tcc SMP preempt mod_unload ARMv7 p2v8 ":
+            raise RuntimeError(f"{ko_name} unexpected vermagic: {vermagic!r}")
+        if this_mod_size != exp_mod_size:
+            raise RuntimeError(f"{ko_name} unexpected struct module size: 0x{this_mod_size:x} (expected 0x{exp_mod_size:x})")
+        aliases = modinfo.get("alias", [])
+        missing_report = []
+        for vname in target_vehicles:
+            if vname in vehicle_ksyms:
+                missing = undef_syms - vehicle_ksyms[vname]
+                if missing:
+                    raise RuntimeError(f"{ko_name} has missing symbols on {vname}: {sorted(missing)}")
+                missing_report.append(f"{vname.replace('usbwifi_kernel_dump_', '')}=0_missing")
+        print(
+            f"Verified {ko_name:18s}: size={ko_path.stat().st_size // 1024:4d}KB, "
+            f"struct_module=0x{this_mod_size:x}, undef={len(undef_syms)}, usb_aliases={len(aliases)} "
+            f"({', '.join(missing_report)})"
+        )
 
 
 def build() -> None:
@@ -266,7 +358,7 @@ def build() -> None:
         "if [ -d /storage/usb0 ]; then\n"
         "    ULOG=\"/storage/usb0/usbwifi_hotspot_log\"\n"
         "    mkdir -p \"$ULOG\" 2>/dev/null\n"
-        "    echo \"Installed v1.7.0 at $(date)\" > \"$ULOG/install_ok.txt\" 2>/dev/null\n"
+        "    echo \"Installed v2.0.0 at $(date)\" > \"$ULOG/install_ok.txt\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.log \"$ULOG/\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.txt \"$ULOG/\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.conf \"$ULOG/\" 2>/dev/null\n"
@@ -310,6 +402,7 @@ def build() -> None:
         "rm -f \"$TMP_DIR/ui_java.lock\" 2>/dev/null\n"
         "sleep 1\n"
         "rmmod 88x2bu 2>/dev/null\n"
+        "rmmod 8851bu 2>/dev/null\n"
         "exit 0\n"
     )
 
@@ -367,7 +460,7 @@ def build() -> None:
     # 6. Background service daemon (svc/usbwifi-hotspot-daemon.sh)
     daemon_sh = (
         "#!/system/bin/sh\n"
-        "# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v1.7.0)\n"
+        "# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.0)\n"
         "export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin\n"
         "export LD_LIBRARY_PATH=/vendor/lib:/system/lib\n"
         "export ANDROID_ROOT=/system\n"
@@ -465,7 +558,7 @@ def build() -> None:
         "    iptables -L -n -v > \"$TMP_DIR/iptables_filter_active.txt\" 2>/dev/null\n"
         "    iptables -t nat -L -n -v > \"$TMP_DIR/iptables_nat_active.txt\" 2>/dev/null\n"
         "    getprop | grep -iE \"(dns|rmnet|net\\.|ril|gsm|dhcp)\" > \"$TMP_DIR/net_props_active.txt\" 2>/dev/null\n"
-        "    logcat -d -v time 2>/dev/null | grep -iE \"(hostapd|dnsmasq|wpa_supplicant|USBWifi|rtwlan|wlan|Softap|Tether|Netd|Dhcp|88x2bu)\" > \"$TMP_DIR/logcat_active.txt\" 2>/dev/null\n"
+        "    logcat -d -v time 2>/dev/null | grep -iE \"(hostapd|dnsmasq|wpa_supplicant|USBWifi|rtwlan|wlan|Softap|Tether|Netd|Dhcp|88x2bu|8851bu)\" > \"$TMP_DIR/logcat_active.txt\" 2>/dev/null\n"
         "}\n"
         "\n"
         "sync_logs_to_usb() {\n"
@@ -595,18 +688,59 @@ def build() -> None:
         "}\n"
         "trap 'on_stop' TERM INT\n"
         "\n"
-        "is_usb_dongle_present() {\n"
-        "    local _d _v _p\n"
+        "detect_usb_dongle_family() {\n"
+        "    local _d _v _p _found_cdrom=0\n"
         "    for _d in /sys/bus/usb/devices/*; do\n"
         "        if [ -f \"$_d/idVendor\" ] && [ -f \"$_d/idProduct\" ]; then\n"
         "            read -r _v < \"$_d/idVendor\" 2>/dev/null\n"
         "            read -r _p < \"$_d/idProduct\" 2>/dev/null\n"
-        "            if [ \"$_v\" = \"$USB_VID\" ] && [ \"$_p\" = \"$USB_PID\" ]; then\n"
-        "                return 0\n"
+        "            case \"${_v}:${_p}\" in\n"
+        "                0bda:b831|0bda:b851|0bda:b832|3625:010b|2357:0142|7392:e611|2001:332a|2c4e:0128|056e:4027|056e:4028|0411:03ed)\n"
+        "                    echo \"8851bu\"\n"
+        "                    return 0\n"
+        "                    ;;\n"
+        "                0bda:b812|0bda:b82c|0bda:b81a|0bda:b820|0bda:b82b|2357:012d|2357:0138|2357:0115|0b05:184c|0b05:1841|0b05:19aa|7392:b822|7392:c822|2001:331c|2001:331e|0846:9055|13b1:0043|056e:4011|\"${USB_VID}:${USB_PID}\")\n"
+        "                    echo \"88x2bu\"\n"
+        "                    return 0\n"
+        "                    ;;\n"
+        "                0bda:1a2b)\n"
+        "                    _found_cdrom=1\n"
+        "                    ;;\n"
+        "            esac\n"
+        "        fi\n"
+        "    done\n"
+        "    if [ \"$_found_cdrom\" -eq 1 ]; then\n"
+        "        echo \"cdrom_8851bu\"\n"
+        "        return 0\n"
+        "    fi\n"
+        "    return 1\n"
+        "}\n"
+        "\n"
+        "is_usb_dongle_present() {\n"
+        "    detect_usb_dongle_family >/dev/null 2>&1\n"
+        "}\n"
+        "\n"
+        "trigger_usb_modeswitch() {\n"
+        "    local _d _v _p _if_dir _if_id\n"
+        "    for _d in /sys/bus/usb/devices/*; do\n"
+        "        if [ -f \"$_d/idVendor\" ] && [ -f \"$_d/idProduct\" ]; then\n"
+        "            read -r _v < \"$_d/idVendor\" 2>/dev/null\n"
+        "            read -r _p < \"$_d/idProduct\" 2>/dev/null\n"
+        "            if [ \"$_v\" = \"0bda\" ] && [ \"$_p\" = \"1a2b\" ]; then\n"
+        "                log_info \"Detected Realtek 0bda:1a2b Virtual CD-ROM at ${_d##*/} -> triggering USB modeswitch\"\n"
+        "                for _if_dir in \"$_d/\"*:*; do\n"
+        "                    [ -d \"$_if_dir\" ] || continue\n"
+        "                    _if_id=\"${_if_dir##*/}\"\n"
+        "                    if [ -e \"/sys/bus/usb/drivers/usb-storage/$_if_id\" ]; then\n"
+        "                        echo \"$_if_id\" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null\n"
+        "                    fi\n"
+        "                    if [ -d /sys/bus/usb/drivers/rtl8851bu ]; then\n"
+        "                        echo \"$_if_id\" > /sys/bus/usb/drivers/rtl8851bu/bind 2>/dev/null\n"
+        "                    fi\n"
+        "                done\n"
         "            fi\n"
         "        fi\n"
         "    done\n"
-        "    return 1\n"
         "}\n"
         "\n"
         "find_usb_wifi_iface() {\n"
@@ -646,7 +780,7 @@ def build() -> None:
         "            _devlink=\"$(readlink \"$_net/device\" 2>/dev/null)\"\n"
         "            _drvlink=\"$(readlink \"$_net/device/driver\" 2>/dev/null)\"\n"
         "            case \"$_netlink $_devlink $_drvlink\" in\n"
-        "                *usb*|*dwc_otg*|*ehci*|*ohci*|*88x2bu*)\n"
+        "                *usb*|*dwc_otg*|*ehci*|*ohci*|*88x2bu*|*8851bu*)\n"
         "                    echo \"$_ifname\"\n"
         "                    return 0\n"
         "                    ;;\n"
@@ -661,24 +795,17 @@ def build() -> None:
         "ACTIVE_IP=\"\"\n"
         "ACTIVE_DNS=\"8.8.8.8\"\n"
         "\n"
-        "ensure_driver_loaded() {\n"
-        "    if grep -q \"^88x2bu \" /proc/modules 2>/dev/null; then\n"
-        "        INSMOD_FAILED=0\n"
+        "load_single_ko() {\n"
+        "    local _mbase=\"$1\" _plat _target_ko _all_args\n"
+        "    if grep -q \"^${_mbase} \" /proc/modules 2>/dev/null; then\n"
         "        return 0\n"
         "    fi\n"
-        "    if [ \"$INSMOD_FAILED\" -eq 1 ]; then\n"
-        "        return 1\n"
-        "    fi\n"
-        "    local _plat _target_ko _all_args _w\n"
         "    _plat=\"$(getprop ro.board.platform 2>/dev/null)\"\n"
-        "    _target_ko=\"$MOD_DIR/$MODULE_NAME\"\n"
-        "    if [ -n \"$_plat\" ] && [ -f \"$MOD_DIR/88x2bu_${_plat}.ko\" ]; then\n"
-        "        _target_ko=\"$MOD_DIR/88x2bu_${_plat}.ko\"\n"
+        "    _target_ko=\"$MOD_DIR/${_mbase}.ko\"\n"
+        "    if [ -n \"$_plat\" ] && [ -f \"$MOD_DIR/${_mbase}_${_plat}.ko\" ]; then\n"
+        "        _target_ko=\"$MOD_DIR/${_mbase}_${_plat}.ko\"\n"
         "    fi\n"
-        "    if [ ! -f \"$_target_ko\" ]; then\n"
-        "        log_info \"Waiting for kernel module $_target_ko (platform=$_plat)\"\n"
-        "        return 1\n"
-        "    fi\n"
+        "    [ -f \"$_target_ko\" ] || return 1\n"
         "    _all_args=\"$MODULE_ARGS\"\n"
         "    case \"$_all_args\" in\n"
         "        *ifname=*) ;;\n"
@@ -686,13 +813,48 @@ def build() -> None:
         "    esac\n"
         "    log_info \"Loading kernel module ${_target_ko##*/} ($_all_args) on $_plat\"\n"
         "    insmod \"$_target_ko\" $_all_args >>\"$TMP_DIR/insmod.log\" 2>&1\n"
-        "    if ! grep -q \"^88x2bu \" /proc/modules 2>/dev/null; then\n"
+        "    if ! grep -q \"^${_mbase} \" /proc/modules 2>/dev/null; then\n"
         "        log_info \"Retrying insmod ${_target_ko##*/} with default params\"\n"
         "        insmod \"$_target_ko\" ifname=rtwlan%d if2name=rtwlan%d >>\"$TMP_DIR/insmod.log\" 2>&1\n"
         "    fi\n"
+        "    grep -q \"^${_mbase} \" /proc/modules 2>/dev/null\n"
+        "}\n"
+        "\n"
+        "ensure_driver_loaded() {\n"
+        "    local _fam _w _ok=0\n"
+        "    _fam=\"$(detect_usb_dongle_family 2>/dev/null)\"\n"
+        "    if [ \"$_fam\" = \"8851bu\" ] || [ \"$_fam\" = \"cdrom_8851bu\" ]; then\n"
+        "        if grep -q \"^8851bu \" /proc/modules 2>/dev/null; then\n"
+        "            _ok=1\n"
+        "        fi\n"
+        "    elif [ \"$_fam\" = \"88x2bu\" ]; then\n"
+        "        if grep -q \"^88x2bu \" /proc/modules 2>/dev/null; then\n"
+        "            _ok=1\n"
+        "        fi\n"
+        "    else\n"
+        "        if grep -q \"^88x2bu \" /proc/modules 2>/dev/null && { [ ! -f \"$MOD_DIR/8851bu.ko\" ] || grep -q \"^8851bu \" /proc/modules 2>/dev/null; }; then\n"
+        "            _ok=1\n"
+        "        fi\n"
+        "    fi\n"
+        "    if [ \"$_ok\" -eq 1 ] && [ \"$_fam\" != \"cdrom_8851bu\" ]; then\n"
+        "        INSMOD_FAILED=0\n"
+        "        return 0\n"
+        "    fi\n"
+        "    if [ \"$INSMOD_FAILED\" -eq 1 ]; then\n"
+        "        return 1\n"
+        "    fi\n"
+        "    load_single_ko 88x2bu\n"
+        "    load_single_ko 8851bu\n"
         "    dmesg > \"$TMP_DIR/dmesg_after_insmod.txt\" 2>/dev/null\n"
-        "    if grep -q \"^88x2bu \" /proc/modules 2>/dev/null; then\n"
-        "        log_info \"88x2bu module loaded successfully\"\n"
+        "    if [ \"$_fam\" = \"cdrom_8851bu\" ]; then\n"
+        "        trigger_usb_modeswitch\n"
+        "        for _w in 1 2 3 4 5; do\n"
+        "            sleep 1\n"
+        "            _fam=\"$(detect_usb_dongle_family 2>/dev/null)\"\n"
+        "            [ \"$_fam\" = \"8851bu\" ] && break\n"
+        "        done\n"
+        "    fi\n"
+        "    if grep -qE \"^(88x2bu|8851bu) \" /proc/modules 2>/dev/null; then\n"
         "        INSMOD_FAILED=0\n"
         "        if is_usb_dongle_present; then\n"
         "            for _w in 1 2 3 4 5; do\n"
@@ -703,7 +865,7 @@ def build() -> None:
         "        ls -l /sys/class/net > \"$TMP_DIR/sys_class_net.txt\" 2>/dev/null\n"
         "        return 0\n"
         "    fi\n"
-        "    log_info \"ERROR: Failed to load ${_target_ko##*/} on platform=$_plat\"\n"
+        "    log_info \"ERROR: Failed to load USB Wi-Fi kernel modules\"\n"
         "    INSMOD_FAILED=1\n"
         "    sync_logs_to_usb\n"
         "    return 1\n"
@@ -1013,12 +1175,16 @@ def build() -> None:
         "    /system/bin/wpa_supplicant -Dnl80211 -i\"$_iface\" -c\"$WIFI_WORK_DIR/wpa_supplicant.conf\" >>\"$TMP_DIR/wpa_supplicant.log\" 2>&1 &\n"
         "    echo $! > \"$TMP_DIR/wpa_supplicant.pid\"\n"
         "    sleep 2\n"
-        "    [ -w \"/proc/net/rtl88x2bu/$_iface/survey_info\" ] && echo 1 > \"/proc/net/rtl88x2bu/$_iface/survey_info\" 2>/dev/null\n"
+        "    for _rproc in \"/proc/net/rtl88x2bu/$_iface\" \"/proc/net/rtl8851bu/$_iface\"; do\n"
+        "        [ -w \"$_rproc/survey_info\" ] && echo 1 > \"$_rproc/survey_info\" 2>/dev/null\n"
+        "    done\n"
         "    [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$_iface\" scan >/dev/null 2>&1\n"
         "    sleep 2\n"
-        "    [ -f \"/proc/net/rtl88x2bu/$_iface/survey_info\" ] && cat \"/proc/net/rtl88x2bu/$_iface/survey_info\" > \"$TMP_DIR/sta_survey.txt\" 2>/dev/null\n"
-        "    [ -f \"/proc/net/rtl88x2bu/$_iface/ap_info\" ] && cat \"/proc/net/rtl88x2bu/$_iface/ap_info\" > \"$TMP_DIR/sta_ap_info.txt\" 2>/dev/null\n"
-        "    [ -f \"/proc/net/rtl88x2bu/$_iface/rx_signal\" ] && cat \"/proc/net/rtl88x2bu/$_iface/rx_signal\" > \"$TMP_DIR/sta_rx_signal.txt\" 2>/dev/null\n"
+        "    for _rproc in \"/proc/net/rtl88x2bu/$_iface\" \"/proc/net/rtl8851bu/$_iface\"; do\n"
+        "        [ -f \"$_rproc/survey_info\" ] && cat \"$_rproc/survey_info\" > \"$TMP_DIR/sta_survey.txt\" 2>/dev/null\n"
+        "        [ -f \"$_rproc/ap_info\" ] && cat \"$_rproc/ap_info\" > \"$TMP_DIR/sta_ap_info.txt\" 2>/dev/null\n"
+        "        [ -f \"$_rproc/rx_signal\" ] && cat \"$_rproc/rx_signal\" > \"$TMP_DIR/sta_rx_signal.txt\" 2>/dev/null\n"
+        "    done\n"
         "    if [ -x /system/bin/wpa_cli ]; then\n"
         "        /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$_iface\" scan_results > \"$TMP_DIR/sta_scan.txt\" 2>/dev/null\n"
         "        /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$_iface\" status > \"$TMP_DIR/wpa_status.txt\" 2>/dev/null\n"
@@ -1028,7 +1194,7 @@ def build() -> None:
         "}\n"
         "\n"
         "is_sta_healthy() {\n"
-        "    local _iface=\"$1\" _wpid _cpid _sta_ip _gw _dns1 _assoc=0\n"
+        "    local _iface=\"$1\" _wpid _cpid _sta_ip _gw _dns1 _assoc=0 _rproc\n"
         "    [ -n \"$_iface\" ] || return 1\n"
         "    [ -d \"/sys/class/net/$_iface\" ] || return 1\n"
         "    if [ -f \"$TMP_DIR/wpa_supplicant.pid\" ]; then\n"
@@ -1037,9 +1203,11 @@ def build() -> None:
         "    else\n"
         "        return 1\n"
         "    fi\n"
-        "    [ -f \"/proc/net/rtl88x2bu/$_iface/survey_info\" ] && cat \"/proc/net/rtl88x2bu/$_iface/survey_info\" > \"$TMP_DIR/sta_survey.txt\" 2>/dev/null\n"
-        "    [ -f \"/proc/net/rtl88x2bu/$_iface/ap_info\" ] && cat \"/proc/net/rtl88x2bu/$_iface/ap_info\" > \"$TMP_DIR/sta_ap_info.txt\" 2>/dev/null\n"
-        "    [ -f \"/proc/net/rtl88x2bu/$_iface/rx_signal\" ] && cat \"/proc/net/rtl88x2bu/$_iface/rx_signal\" > \"$TMP_DIR/sta_rx_signal.txt\" 2>/dev/null\n"
+        "    for _rproc in \"/proc/net/rtl88x2bu/$_iface\" \"/proc/net/rtl8851bu/$_iface\"; do\n"
+        "        [ -f \"$_rproc/survey_info\" ] && cat \"$_rproc/survey_info\" > \"$TMP_DIR/sta_survey.txt\" 2>/dev/null\n"
+        "        [ -f \"$_rproc/ap_info\" ] && cat \"$_rproc/ap_info\" > \"$TMP_DIR/sta_ap_info.txt\" 2>/dev/null\n"
+        "        [ -f \"$_rproc/rx_signal\" ] && cat \"$_rproc/rx_signal\" > \"$TMP_DIR/sta_rx_signal.txt\" 2>/dev/null\n"
+        "    done\n"
         "    if [ -x /system/bin/wpa_cli ]; then\n"
         "        /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$_iface\" status > \"$TMP_DIR/wpa_status.txt\" 2>/dev/null\n"
         "        /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$_iface\" signal_poll > \"$TMP_DIR/wpa_signal.txt\" 2>/dev/null\n"
@@ -1108,8 +1276,8 @@ def build() -> None:
         "    return 0\n"
         "}\n"
         "\n"
-        "log_info \"Service started (pid=$$), monitoring USB $USB_VID:$USB_PID\"\n"
-        "# Pre-load 88x2bu driver immediately at boot (before Android Auto / system_server starts)\n"
+        "log_info \"Service started (pid=$$), monitoring USB Wi-Fi (88x2bu + 8851bu/8831bu)\"\n"
+        "# Pre-load 88x2bu and 8851bu drivers immediately at boot (before Android Auto / system_server starts)\n"
         "# so usb_driver is registered and blocks usbfs AOA Request 51/52/53 on any hotplug\n"
         "ensure_driver_loaded\n"
         "\n"
@@ -1140,10 +1308,14 @@ def build() -> None:
         "    if [ -f \"$TMP_DIR/trigger_scan\" ]; then\n"
         "        rm -f \"$TMP_DIR/trigger_scan\" 2>/dev/null\n"
         "        if [ -n \"$ACTIVE_IFACE\" ] && [ \"$WIFI_MODE\" = \"sta\" ]; then\n"
-        "            [ -w \"/proc/net/rtl88x2bu/$ACTIVE_IFACE/survey_info\" ] && echo 1 > \"/proc/net/rtl88x2bu/$ACTIVE_IFACE/survey_info\" 2>/dev/null\n"
+        "            for _rproc in \"/proc/net/rtl88x2bu/$ACTIVE_IFACE\" \"/proc/net/rtl8851bu/$ACTIVE_IFACE\"; do\n"
+        "                [ -w \"$_rproc/survey_info\" ] && echo 1 > \"$_rproc/survey_info\" 2>/dev/null\n"
+        "            done\n"
         "            [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$ACTIVE_IFACE\" scan >/dev/null 2>&1\n"
         "            sleep 2\n"
-        "            [ -f \"/proc/net/rtl88x2bu/$ACTIVE_IFACE/survey_info\" ] && cat \"/proc/net/rtl88x2bu/$ACTIVE_IFACE/survey_info\" > \"$TMP_DIR/sta_survey.txt\" 2>/dev/null\n"
+        "            for _rproc in \"/proc/net/rtl88x2bu/$ACTIVE_IFACE\" \"/proc/net/rtl8851bu/$ACTIVE_IFACE\"; do\n"
+        "                [ -f \"$_rproc/survey_info\" ] && cat \"$_rproc/survey_info\" > \"$TMP_DIR/sta_survey.txt\" 2>/dev/null\n"
+        "            done\n"
         "            [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$ACTIVE_IFACE\" scan_results > \"$TMP_DIR/sta_scan.txt\" 2>/dev/null\n"
         "        fi\n"
         "    fi\n"
@@ -1196,7 +1368,7 @@ def build() -> None:
         "    else\n"
         "        INSMOD_FAILED=0\n"
         "        if [ -n \"$ACTIVE_IFACE\" ]; then\n"
-        "            log_info \"USB dongle $USB_VID:$USB_PID unplugged -> stopping daemons\"\n"
+        "            log_info \"USB dongle unplugged -> stopping daemons\"\n"
         "            stop_ap_daemons\n"
         "            stop_sta_daemons\n"
         "            ACTIVE_IFACE=\"\"\n"
@@ -1245,13 +1417,13 @@ def build() -> None:
 
     version_manifest = json.dumps(
         {
-            "version": "1.9.0",
+            "version": "2.0.0",
             "repo": "GRT47/HKG_5W_USB_Wlan",
             "branch": "main",
             "sha256_jar": sha256_jar,
             "sha256_daemon": sha256_daemon,
             "sha256_launch": sha256_launch,
-            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode with MAP 3s Long-Press & GitHub OTA",
+            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (RTL8812BU/8822BU + RTL8831BU/8851BU Support)",
         },
         indent=2,
         ensure_ascii=False,
@@ -1274,6 +1446,8 @@ def build() -> None:
     if MODULES_IN_DIR.exists():
         for ko_file in sorted(MODULES_IN_DIR.glob("*.ko")):
             shutil.copy2(ko_file, pkg_mod_dir / ko_file.name)
+
+    verify_kernel_modules(pkg_mod_dir)
 
     # Inner NEMESIS package zip (usb_root/packages/usbwifi.hotspot.zip)
     inner_zip_path = USB_ROOT_DIR / "packages" / "usbwifi.hotspot.zip"

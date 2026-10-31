@@ -1,9 +1,9 @@
 {
-  "version": "1.9.0",
+  "version": "2.0.0",
   "repo": "GRT47/HKG_5W_USB_Wlan",
   "branch": "main",
-  "sha256_jar": "8145005077b59e43272290ec3181a081e8799ec840bc1d60d04be3a8e3b98f11",
-  "sha256_daemon": "e484d38efa24fcc686f661ac0497d4c02971dd394cd6d4d3fb962c7e7b8ee65d",
+  "sha256_jar": "4f1e37f19877f2399fd400be9a235d74602a1e627c7cb14d026e2cfa3975b604",
+  "sha256_daemon": "672f2bc332de378899725006525b43c441b906be3cf000b94dbfeceea030f822",
   "sha256_launch": "f178706c82d54480db7ed44041ffeaa2e9ea3e958ac1600dc850a4d385c4f9f4",
-  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode with MAP 3s Long-Press & GitHub OTA"
+  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (RTL8812BU/8822BU + RTL8831BU/8851BU Support)"
 }

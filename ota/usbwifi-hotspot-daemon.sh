@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v1.7.0)
+# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.0)
 export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin
 export LD_LIBRARY_PATH=/vendor/lib:/system/lib
 export ANDROID_ROOT=/system
@@ -97,7 +97,7 @@ save_active_snapshot() {
     iptables -L -n -v > "$TMP_DIR/iptables_filter_active.txt" 2>/dev/null
     iptables -t nat -L -n -v > "$TMP_DIR/iptables_nat_active.txt" 2>/dev/null
     getprop | grep -iE "(dns|rmnet|net\.|ril|gsm|dhcp)" > "$TMP_DIR/net_props_active.txt" 2>/dev/null
-    logcat -d -v time 2>/dev/null | grep -iE "(hostapd|dnsmasq|wpa_supplicant|USBWifi|rtwlan|wlan|Softap|Tether|Netd|Dhcp|88x2bu)" > "$TMP_DIR/logcat_active.txt" 2>/dev/null
+    logcat -d -v time 2>/dev/null | grep -iE "(hostapd|dnsmasq|wpa_supplicant|USBWifi|rtwlan|wlan|Softap|Tether|Netd|Dhcp|88x2bu|8851bu)" > "$TMP_DIR/logcat_active.txt" 2>/dev/null
 }
 
 sync_logs_to_usb() {
@@ -227,18 +227,59 @@ on_stop() {
 }
 trap 'on_stop' TERM INT
 
-is_usb_dongle_present() {
-    local _d _v _p
+detect_usb_dongle_family() {
+    local _d _v _p _found_cdrom=0
     for _d in /sys/bus/usb/devices/*; do
         if [ -f "$_d/idVendor" ] && [ -f "$_d/idProduct" ]; then
             read -r _v < "$_d/idVendor" 2>/dev/null
             read -r _p < "$_d/idProduct" 2>/dev/null
-            if [ "$_v" = "$USB_VID" ] && [ "$_p" = "$USB_PID" ]; then
-                return 0
+            case "${_v}:${_p}" in
+                0bda:b831|0bda:b851|0bda:b832|3625:010b|2357:0142|7392:e611|2001:332a|2c4e:0128|056e:4027|056e:4028|0411:03ed)
+                    echo "8851bu"
+                    return 0
+                    ;;
+                0bda:b812|0bda:b82c|0bda:b81a|0bda:b820|0bda:b82b|2357:012d|2357:0138|2357:0115|0b05:184c|0b05:1841|0b05:19aa|7392:b822|7392:c822|2001:331c|2001:331e|0846:9055|13b1:0043|056e:4011|"${USB_VID}:${USB_PID}")
+                    echo "88x2bu"
+                    return 0
+                    ;;
+                0bda:1a2b)
+                    _found_cdrom=1
+                    ;;
+            esac
+        fi
+    done
+    if [ "$_found_cdrom" -eq 1 ]; then
+        echo "cdrom_8851bu"
+        return 0
+    fi
+    return 1
+}
+
+is_usb_dongle_present() {
+    detect_usb_dongle_family >/dev/null 2>&1
+}
+
+trigger_usb_modeswitch() {
+    local _d _v _p _if_dir _if_id
+    for _d in /sys/bus/usb/devices/*; do
+        if [ -f "$_d/idVendor" ] && [ -f "$_d/idProduct" ]; then
+            read -r _v < "$_d/idVendor" 2>/dev/null
+            read -r _p < "$_d/idProduct" 2>/dev/null
+            if [ "$_v" = "0bda" ] && [ "$_p" = "1a2b" ]; then
+                log_info "Detected Realtek 0bda:1a2b Virtual CD-ROM at ${_d##*/} -> triggering USB modeswitch"
+                for _if_dir in "$_d/"*:*; do
+                    [ -d "$_if_dir" ] || continue
+                    _if_id="${_if_dir##*/}"
+                    if [ -e "/sys/bus/usb/drivers/usb-storage/$_if_id" ]; then
+                        echo "$_if_id" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null
+                    fi
+                    if [ -d /sys/bus/usb/drivers/rtl8851bu ]; then
+                        echo "$_if_id" > /sys/bus/usb/drivers/rtl8851bu/bind 2>/dev/null
+                    fi
+                done
             fi
         fi
     done
-    return 1
 }
 
 find_usb_wifi_iface() {
@@ -278,7 +319,7 @@ find_usb_wifi_iface() {
             _devlink="$(readlink "$_net/device" 2>/dev/null)"
             _drvlink="$(readlink "$_net/device/driver" 2>/dev/null)"
             case "$_netlink $_devlink $_drvlink" in
-                *usb*|*dwc_otg*|*ehci*|*ohci*|*88x2bu*)
+                *usb*|*dwc_otg*|*ehci*|*ohci*|*88x2bu*|*8851bu*)
                     echo "$_ifname"
                     return 0
                     ;;
@@ -293,24 +334,17 @@ ACTIVE_IFACE=""
 ACTIVE_IP=""
 ACTIVE_DNS="8.8.8.8"
 
-ensure_driver_loaded() {
-    if grep -q "^88x2bu " /proc/modules 2>/dev/null; then
-        INSMOD_FAILED=0
+load_single_ko() {
+    local _mbase="$1" _plat _target_ko _all_args
+    if grep -q "^${_mbase} " /proc/modules 2>/dev/null; then
         return 0
     fi
-    if [ "$INSMOD_FAILED" -eq 1 ]; then
-        return 1
-    fi
-    local _plat _target_ko _all_args _w
     _plat="$(getprop ro.board.platform 2>/dev/null)"
-    _target_ko="$MOD_DIR/$MODULE_NAME"
-    if [ -n "$_plat" ] && [ -f "$MOD_DIR/88x2bu_${_plat}.ko" ]; then
-        _target_ko="$MOD_DIR/88x2bu_${_plat}.ko"
+    _target_ko="$MOD_DIR/${_mbase}.ko"
+    if [ -n "$_plat" ] && [ -f "$MOD_DIR/${_mbase}_${_plat}.ko" ]; then
+        _target_ko="$MOD_DIR/${_mbase}_${_plat}.ko"
     fi
-    if [ ! -f "$_target_ko" ]; then
-        log_info "Waiting for kernel module $_target_ko (platform=$_plat)"
-        return 1
-    fi
+    [ -f "$_target_ko" ] || return 1
     _all_args="$MODULE_ARGS"
     case "$_all_args" in
         *ifname=*) ;;
@@ -318,13 +352,48 @@ ensure_driver_loaded() {
     esac
     log_info "Loading kernel module ${_target_ko##*/} ($_all_args) on $_plat"
     insmod "$_target_ko" $_all_args >>"$TMP_DIR/insmod.log" 2>&1
-    if ! grep -q "^88x2bu " /proc/modules 2>/dev/null; then
+    if ! grep -q "^${_mbase} " /proc/modules 2>/dev/null; then
         log_info "Retrying insmod ${_target_ko##*/} with default params"
         insmod "$_target_ko" ifname=rtwlan%d if2name=rtwlan%d >>"$TMP_DIR/insmod.log" 2>&1
     fi
+    grep -q "^${_mbase} " /proc/modules 2>/dev/null
+}
+
+ensure_driver_loaded() {
+    local _fam _w _ok=0
+    _fam="$(detect_usb_dongle_family 2>/dev/null)"
+    if [ "$_fam" = "8851bu" ] || [ "$_fam" = "cdrom_8851bu" ]; then
+        if grep -q "^8851bu " /proc/modules 2>/dev/null; then
+            _ok=1
+        fi
+    elif [ "$_fam" = "88x2bu" ]; then
+        if grep -q "^88x2bu " /proc/modules 2>/dev/null; then
+            _ok=1
+        fi
+    else
+        if grep -q "^88x2bu " /proc/modules 2>/dev/null && { [ ! -f "$MOD_DIR/8851bu.ko" ] || grep -q "^8851bu " /proc/modules 2>/dev/null; }; then
+            _ok=1
+        fi
+    fi
+    if [ "$_ok" -eq 1 ] && [ "$_fam" != "cdrom_8851bu" ]; then
+        INSMOD_FAILED=0
+        return 0
+    fi
+    if [ "$INSMOD_FAILED" -eq 1 ]; then
+        return 1
+    fi
+    load_single_ko 88x2bu
+    load_single_ko 8851bu
     dmesg > "$TMP_DIR/dmesg_after_insmod.txt" 2>/dev/null
-    if grep -q "^88x2bu " /proc/modules 2>/dev/null; then
-        log_info "88x2bu module loaded successfully"
+    if [ "$_fam" = "cdrom_8851bu" ]; then
+        trigger_usb_modeswitch
+        for _w in 1 2 3 4 5; do
+            sleep 1
+            _fam="$(detect_usb_dongle_family 2>/dev/null)"
+            [ "$_fam" = "8851bu" ] && break
+        done
+    fi
+    if grep -qE "^(88x2bu|8851bu) " /proc/modules 2>/dev/null; then
         INSMOD_FAILED=0
         if is_usb_dongle_present; then
             for _w in 1 2 3 4 5; do
@@ -335,7 +404,7 @@ ensure_driver_loaded() {
         ls -l /sys/class/net > "$TMP_DIR/sys_class_net.txt" 2>/dev/null
         return 0
     fi
-    log_info "ERROR: Failed to load ${_target_ko##*/} on platform=$_plat"
+    log_info "ERROR: Failed to load USB Wi-Fi kernel modules"
     INSMOD_FAILED=1
     sync_logs_to_usb
     return 1
@@ -645,12 +714,16 @@ EOF
     /system/bin/wpa_supplicant -Dnl80211 -i"$_iface" -c"$WIFI_WORK_DIR/wpa_supplicant.conf" >>"$TMP_DIR/wpa_supplicant.log" 2>&1 &
     echo $! > "$TMP_DIR/wpa_supplicant.pid"
     sleep 2
-    [ -w "/proc/net/rtl88x2bu/$_iface/survey_info" ] && echo 1 > "/proc/net/rtl88x2bu/$_iface/survey_info" 2>/dev/null
+    for _rproc in "/proc/net/rtl88x2bu/$_iface" "/proc/net/rtl8851bu/$_iface"; do
+        [ -w "$_rproc/survey_info" ] && echo 1 > "$_rproc/survey_info" 2>/dev/null
+    done
     [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" scan >/dev/null 2>&1
     sleep 2
-    [ -f "/proc/net/rtl88x2bu/$_iface/survey_info" ] && cat "/proc/net/rtl88x2bu/$_iface/survey_info" > "$TMP_DIR/sta_survey.txt" 2>/dev/null
-    [ -f "/proc/net/rtl88x2bu/$_iface/ap_info" ] && cat "/proc/net/rtl88x2bu/$_iface/ap_info" > "$TMP_DIR/sta_ap_info.txt" 2>/dev/null
-    [ -f "/proc/net/rtl88x2bu/$_iface/rx_signal" ] && cat "/proc/net/rtl88x2bu/$_iface/rx_signal" > "$TMP_DIR/sta_rx_signal.txt" 2>/dev/null
+    for _rproc in "/proc/net/rtl88x2bu/$_iface" "/proc/net/rtl8851bu/$_iface"; do
+        [ -f "$_rproc/survey_info" ] && cat "$_rproc/survey_info" > "$TMP_DIR/sta_survey.txt" 2>/dev/null
+        [ -f "$_rproc/ap_info" ] && cat "$_rproc/ap_info" > "$TMP_DIR/sta_ap_info.txt" 2>/dev/null
+        [ -f "$_rproc/rx_signal" ] && cat "$_rproc/rx_signal" > "$TMP_DIR/sta_rx_signal.txt" 2>/dev/null
+    done
     if [ -x /system/bin/wpa_cli ]; then
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" scan_results > "$TMP_DIR/sta_scan.txt" 2>/dev/null
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" status > "$TMP_DIR/wpa_status.txt" 2>/dev/null
@@ -660,7 +733,7 @@ EOF
 }
 
 is_sta_healthy() {
-    local _iface="$1" _wpid _cpid _sta_ip _gw _dns1 _assoc=0
+    local _iface="$1" _wpid _cpid _sta_ip _gw _dns1 _assoc=0 _rproc
     [ -n "$_iface" ] || return 1
     [ -d "/sys/class/net/$_iface" ] || return 1
     if [ -f "$TMP_DIR/wpa_supplicant.pid" ]; then
@@ -669,9 +742,11 @@ is_sta_healthy() {
     else
         return 1
     fi
-    [ -f "/proc/net/rtl88x2bu/$_iface/survey_info" ] && cat "/proc/net/rtl88x2bu/$_iface/survey_info" > "$TMP_DIR/sta_survey.txt" 2>/dev/null
-    [ -f "/proc/net/rtl88x2bu/$_iface/ap_info" ] && cat "/proc/net/rtl88x2bu/$_iface/ap_info" > "$TMP_DIR/sta_ap_info.txt" 2>/dev/null
-    [ -f "/proc/net/rtl88x2bu/$_iface/rx_signal" ] && cat "/proc/net/rtl88x2bu/$_iface/rx_signal" > "$TMP_DIR/sta_rx_signal.txt" 2>/dev/null
+    for _rproc in "/proc/net/rtl88x2bu/$_iface" "/proc/net/rtl8851bu/$_iface"; do
+        [ -f "$_rproc/survey_info" ] && cat "$_rproc/survey_info" > "$TMP_DIR/sta_survey.txt" 2>/dev/null
+        [ -f "$_rproc/ap_info" ] && cat "$_rproc/ap_info" > "$TMP_DIR/sta_ap_info.txt" 2>/dev/null
+        [ -f "$_rproc/rx_signal" ] && cat "$_rproc/rx_signal" > "$TMP_DIR/sta_rx_signal.txt" 2>/dev/null
+    done
     if [ -x /system/bin/wpa_cli ]; then
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" status > "$TMP_DIR/wpa_status.txt" 2>/dev/null
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" signal_poll > "$TMP_DIR/wpa_signal.txt" 2>/dev/null
@@ -740,8 +815,8 @@ is_ap_healthy() {
     return 0
 }
 
-log_info "Service started (pid=$$), monitoring USB $USB_VID:$USB_PID"
-# Pre-load 88x2bu driver immediately at boot (before Android Auto / system_server starts)
+log_info "Service started (pid=$$), monitoring USB Wi-Fi (88x2bu + 8851bu/8831bu)"
+# Pre-load 88x2bu and 8851bu drivers immediately at boot (before Android Auto / system_server starts)
 # so usb_driver is registered and blocks usbfs AOA Request 51/52/53 on any hotplug
 ensure_driver_loaded
 
@@ -772,10 +847,14 @@ while true; do
     if [ -f "$TMP_DIR/trigger_scan" ]; then
         rm -f "$TMP_DIR/trigger_scan" 2>/dev/null
         if [ -n "$ACTIVE_IFACE" ] && [ "$WIFI_MODE" = "sta" ]; then
-            [ -w "/proc/net/rtl88x2bu/$ACTIVE_IFACE/survey_info" ] && echo 1 > "/proc/net/rtl88x2bu/$ACTIVE_IFACE/survey_info" 2>/dev/null
+            for _rproc in "/proc/net/rtl88x2bu/$ACTIVE_IFACE" "/proc/net/rtl8851bu/$ACTIVE_IFACE"; do
+                [ -w "$_rproc/survey_info" ] && echo 1 > "$_rproc/survey_info" 2>/dev/null
+            done
             [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$ACTIVE_IFACE" scan >/dev/null 2>&1
             sleep 2
-            [ -f "/proc/net/rtl88x2bu/$ACTIVE_IFACE/survey_info" ] && cat "/proc/net/rtl88x2bu/$ACTIVE_IFACE/survey_info" > "$TMP_DIR/sta_survey.txt" 2>/dev/null
+            for _rproc in "/proc/net/rtl88x2bu/$ACTIVE_IFACE" "/proc/net/rtl8851bu/$ACTIVE_IFACE"; do
+                [ -f "$_rproc/survey_info" ] && cat "$_rproc/survey_info" > "$TMP_DIR/sta_survey.txt" 2>/dev/null
+            done
             [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$ACTIVE_IFACE" scan_results > "$TMP_DIR/sta_scan.txt" 2>/dev/null
         fi
     fi
@@ -828,7 +907,7 @@ while true; do
     else
         INSMOD_FAILED=0
         if [ -n "$ACTIVE_IFACE" ]; then
-            log_info "USB dongle $USB_VID:$USB_PID unplugged -> stopping daemons"
+            log_info "USB dongle unplugged -> stopping daemons"
             stop_ap_daemons
             stop_sta_daemons
             ACTIVE_IFACE=""

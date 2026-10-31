@@ -2,6 +2,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ ! -f "$SCRIPT_DIR/config_tcc897x.txt" ]; then
+    SCRIPT_DIR="/mnt/host/g/github/HKG_headunit_usbwifi/package_usbwifi_hotspot/kernel_build"
+fi
 UBUNTU_DIR="/mnt/host/wsl/ubuntu"
 
 mkdir -p "$UBUNTU_DIR/mnt/host/c" "$UBUNTU_DIR/mnt/host/g"
@@ -715,32 +718,473 @@ OUT_MODS="/mnt/host/g/github/HKG_headunit_usbwifi/package_usbwifi_hotspot/module
 mkdir -p "$OUT_MODS"
 
 # 1. Build 88x2bu_tcc897x.ko (Niro EV / tcc897x)
-echo "=== Building 88x2bu_tcc897x.ko (tcc897x) ==="
-prepare_kernel ".config.tcc897x" "160"
-cd /opt/src/rtl88x2bu
-make -C /opt/src/linux-3.18.24 M=/opt/src/rtl88x2bu ARCH=arm CROSS_COMPILE=arm-eabi- clean
-make -C /opt/src/linux-3.18.24 M=/opt/src/rtl88x2bu \
-    ARCH=arm CROSS_COMPILE=arm-eabi- \
-    CONFIG_RTL8822BU=m \
-    -j$(nproc) modules
-arm-eabi-strip --strip-debug /opt/src/rtl88x2bu/88x2bu.ko
-ls -lh /opt/src/rtl88x2bu/88x2bu.ko
-cp /opt/src/rtl88x2bu/88x2bu.ko "$OUT_MODS/88x2bu_tcc897x.ko"
+if [ ! -f "$OUT_MODS/88x2bu_tcc897x.ko" ]; then
+    echo "=== Building 88x2bu_tcc897x.ko (tcc897x) ==="
+    prepare_kernel ".config.tcc897x" "160"
+    cd /opt/src/rtl88x2bu
+    make -C /opt/src/linux-3.18.24 M=/opt/src/rtl88x2bu ARCH=arm CROSS_COMPILE=arm-eabi- clean
+    make -C /opt/src/linux-3.18.24 M=/opt/src/rtl88x2bu \
+        ARCH=arm CROSS_COMPILE=arm-eabi- \
+        CONFIG_RTL8822BU=m \
+        -j$(nproc) modules
+    arm-eabi-strip --strip-debug /opt/src/rtl88x2bu/88x2bu.ko
+    ls -lh /opt/src/rtl88x2bu/88x2bu.ko
+    cp /opt/src/rtl88x2bu/88x2bu.ko "$OUT_MODS/88x2bu_tcc897x.ko"
+fi
 
 # 2. Build 88x2bu.ko (EV6 / tcc803x)
-echo "=== Building 88x2bu.ko (tcc803x) ==="
-prepare_kernel ".config.tcc803x" "256"
-cd /opt/src/rtl88x2bu
-make -C /opt/src/linux-3.18.24 M=/opt/src/rtl88x2bu ARCH=arm CROSS_COMPILE=arm-eabi- clean
-make -C /opt/src/linux-3.18.24 M=/opt/src/rtl88x2bu \
-    ARCH=arm CROSS_COMPILE=arm-eabi- \
-    CONFIG_RTL8822BU=m \
-    -j$(nproc) modules
-arm-eabi-strip --strip-debug /opt/src/rtl88x2bu/88x2bu.ko
-ls -lh /opt/src/rtl88x2bu/88x2bu.ko
-cp /opt/src/rtl88x2bu/88x2bu.ko "$OUT_MODS/88x2bu.ko"
+if [ ! -f "$OUT_MODS/88x2bu.ko" ]; then
+    echo "=== Building 88x2bu.ko (tcc803x) ==="
+    prepare_kernel ".config.tcc803x" "256"
+    cd /opt/src/rtl88x2bu
+    make -C /opt/src/linux-3.18.24 M=/opt/src/rtl88x2bu ARCH=arm CROSS_COMPILE=arm-eabi- clean
+    make -C /opt/src/linux-3.18.24 M=/opt/src/rtl88x2bu \
+        ARCH=arm CROSS_COMPILE=arm-eabi- \
+        CONFIG_RTL8822BU=m \
+        -j$(nproc) modules
+    arm-eabi-strip --strip-debug /opt/src/rtl88x2bu/88x2bu.ko
+    ls -lh /opt/src/rtl88x2bu/88x2bu.ko
+    cp /opt/src/rtl88x2bu/88x2bu.ko "$OUT_MODS/88x2bu.ko"
+fi
 
-echo "=== BOTH KERNEL MODULES BUILT SUCCESSFULLY ==="
+# ==============================================================================
+# 3 & 4. Patch & Build 8851bu.ko / 8851bu_tcc897x.ko (RTL8831BU / RTL8851BU AX900)
+# ==============================================================================
+if [ ! -d /opt/src/rtl8851bu/.git ]; then
+    rm -rf /opt/src/rtl8851bu
+    git clone --depth 1 https://github.com/fofajardo/rtl8851bu.git /opt/src/rtl8851bu
+fi
+
+cd /opt/src/rtl8851bu
+git checkout -- .
+
+# Patch Makefile for GCC 4.7 and Telechips 3.18.24-tcc ARM kernel
+sed -i 's/EXTRA_CFLAGS += -O1/EXTRA_CFLAGS += -O1 -DCONFIG_LITTLE_ENDIAN -DCONFIG_IOCTL_CFG80211 -DRTW_USE_CFG80211_STA_EVENT -Dstrscpy=strlcpy/' Makefile
+sed -i 's/CONFIG_PLATFORM_I386_PC = y/CONFIG_PLATFORM_I386_PC = n/' Makefile
+sed -i 's/#_PLATFORM_FILES := platform\/platform_ops.o/_PLATFORM_FILES := platform\/platform_ops.o/' Makefile
+sed -i 's/CONFIG_MP_INCLUDED = y/CONFIG_MP_INCLUDED = n/' Makefile
+sed -i 's/CONFIG_LOAD_PHY_PARA_FROM_FILE = y/CONFIG_LOAD_PHY_PARA_FROM_FILE = n/' Makefile
+sed -i 's/CONFIG_EFUSE_CONFIG_FILE = y/CONFIG_EFUSE_CONFIG_FILE = n/' Makefile
+sed -i 's/CONFIG_RTW_NAPI = y/CONFIG_RTW_NAPI = n/' Makefile
+sed -i 's/CONFIG_RTW_GRO = y/CONFIG_RTW_GRO = n/' Makefile
+
+python3 -c '
+# 1. os_dep/osdep_service_linux.c (fix u16 cast to atomic_t*)
+p_osdep = "os_dep/osdep_service_linux.c"
+s = open(p_osdep, "r").read()
+assert "ATOMIC_INC((ATOMIC_T *)&rtw_warn_on_cnt);" in s
+s = s.replace("ATOMIC_INC((ATOMIC_T *)&rtw_warn_on_cnt);", "rtw_warn_on_cnt++;", 1)
+open(p_osdep, "w").write(s)
+
+# 2. phl/test/phl_dbg_cmd.h & phl/test/phl_dbg_cmd.c (move _get_hex_from_string outside CONFIG_PHL_TEST_SUITE)
+p_phl = "phl/test/phl_dbg_cmd.h"
+s = open(p_phl, "r").read()
+assert "#ifdef CONFIG_PHL_TEST_SUITE" in s
+s = s.replace("#ifdef CONFIG_PHL_TEST_SUITE", "bool _get_hex_from_string(char *szstr, u32 *val);\n#ifdef CONFIG_PHL_TEST_SUITE", 1)
+open(p_phl, "w").write(s)
+
+p_phl_c = "phl/test/phl_dbg_cmd.c"
+sc = open(p_phl_c, "r").read()
+assert "#ifdef CONFIG_PHL_TEST_SUITE\nbool\n_is_hex_digit" in sc
+assert "void\n_phl_dbg_cmd_switch_chbw" in sc
+sc = sc.replace("#ifdef CONFIG_PHL_TEST_SUITE\nbool\n_is_hex_digit", "bool\n_is_hex_digit", 1)
+sc = sc.replace("void\n_phl_dbg_cmd_switch_chbw", "#ifdef CONFIG_PHL_TEST_SUITE\nvoid\n_phl_dbg_cmd_switch_chbw", 1)
+open(p_phl_c, "w").write(sc)
+
+# 3. os_dep/linux/rtw_cfg.c (default interface rtwlan%d, disable NAPI & GRO)
+p_rcfg = "os_dep/linux/rtw_cfg.c"
+s = open(p_rcfg, "r").read()
+assert "char *ifname = \"wlan%d\";" in s
+s = s.replace("char *ifname = \"wlan%d\";", "char *ifname = \"rtwlan%d\";", 1)
+s = s.replace("char *if2name = \"p2p%d\";", "char *if2name = \"rtwlan%d\";", 1)
+s = s.replace("char *if2name = \"ap%d\";", "char *if2name = \"rtwlan%d\";", 1)
+assert "int rtw_en_napi = 1;" in s
+s = s.replace("int rtw_en_napi = 1;", "int rtw_en_napi = 0;", 1)
+assert "int rtw_en_gro = 1;" in s
+s = s.replace("int rtw_en_gro = 1;", "int rtw_en_gro = 0;", 1)
+open(p_rcfg, "w").write(s)
+print("Successfully patched os_dep/linux/rtw_cfg.c")
+
+# 4. os_dep/linux/os_intfs.c (do not bind netdev sysfs parent to usb_interface + guard netdev_close on surprise remove)
+p_intfs = "os_dep/linux/os_intfs.c"
+s = open(p_intfs, "r").read()
+target_set_ndev = "\tSET_NETDEV_DEV(ndev, dvobj_to_dev(adapter_to_dvobj(adapter)));"
+assert target_set_ndev in s, "target_set_ndev not found in os_intfs.c"
+s = s.replace(target_set_ndev, "\t/* Do not bind netdev sysfs parent to usb_interface so hot-unplug can safely quiesce */", 1)
+
+target_close = """\tRTW_INFO(FUNC_NDEV_FMT" , netif_up=%d\\n", FUNC_NDEV_ARG(pnetdev), padapter->netif_up);
+
+\tpmlmepriv->LinkDetectInfo.bBusyTraffic = _FALSE;"""
+
+replacement_close = """\tRTW_INFO(FUNC_NDEV_FMT" , netif_up=%d\\n", FUNC_NDEV_ARG(pnetdev), padapter->netif_up);
+
+\tpmlmepriv->LinkDetectInfo.bBusyTraffic = _FALSE;
+
+\tif (dev_is_surprise_removed(dvobj) || dev_is_drv_stopped(dvobj) || dvobj->processing_dev_remove == _TRUE) {
+\t\tpadapter->netif_up = _FALSE;
+\t\tif (pnetdev)
+\t\t\trtw_netif_stop_queue(pnetdev);
+\t\tRTW_INFO("-netdev_close (surprise removed)\\n");
+\t\treturn 0;
+\t}"""
+
+assert target_close in s, "target_close not found in os_intfs.c"
+s = s.replace(target_close, replacement_close, 1)
+open(p_intfs, "w").write(s)
+print("Successfully patched os_dep/linux/os_intfs.c")
+
+# 5. os_dep/linux/usb_intf.c (RTL8831BU/8851BU VID:PIDs, 0bda:1a2b CD-ROM auto-modeswitch, AOA devt block, surprise remove order)
+p_usb = "os_dep/linux/usb_intf.c"
+u = open(p_usb, "r").read()
+
+target_ids = """#ifdef CONFIG_RTL8851B
+\t/*=== Realtek demoboard ===*/
+\t{USB_DEVICE_AND_INTERFACE_INFO(USB_VENDER_ID_REALTEK, 0xB851, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+
+\t/*=== TP Link TX10UB AX900 ===*/
+\t{USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_TPLINK, 0x010B, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+
+\t/*=== EDIMAX EW-7611UXB ===*/
+\t{USB_DEVICE_AND_INTERFACE_INFO(USB_VENDER_ID_EDIMAX, 0xE611, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+#endif /* CONFIG_RTL8851B */"""
+
+replacement_ids = """#ifdef CONFIG_RTL8851B
+\t/*=== Realtek RTL8831BU / RTL8851BU AX900 Wi-Fi 6 ===*/
+\t{USB_DEVICE_AND_INTERFACE_INFO(USB_VENDER_ID_REALTEK, 0xB831, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+\t{USB_DEVICE_AND_INTERFACE_INFO(USB_VENDER_ID_REALTEK, 0xB851, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+\t{USB_DEVICE_AND_INTERFACE_INFO(USB_VENDER_ID_REALTEK, 0xB832, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+
+\t/*=== TP-Link TX10UB Nano / TX1U Nano AX900 ===*/
+\t{USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_TPLINK, 0x010B, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+\t{USB_DEVICE_AND_INTERFACE_INFO(0x2357, 0x0142, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+
+\t/*=== EDIMAX / D-Link / Mercusys / Elecom / Buffalo RTL8831BU & RTL8851BU ===*/
+\t{USB_DEVICE_AND_INTERFACE_INFO(USB_VENDER_ID_EDIMAX, 0xE611, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+\t{USB_DEVICE_AND_INTERFACE_INFO(0x2001, 0x332A, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+\t{USB_DEVICE_AND_INTERFACE_INFO(0x2C4E, 0x0128, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+\t{USB_DEVICE_AND_INTERFACE_INFO(0x056E, 0x4027, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+\t{USB_DEVICE_AND_INTERFACE_INFO(0x056E, 0x4028, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+\t{USB_DEVICE_AND_INTERFACE_INFO(0x0411, 0x03ED, 0xff, 0xff, 0xff), .driver_info = RTL8851B},
+
+\t/*=== Realtek Auto-Install Virtual CD-ROM (0bda:1a2b -> auto modeswitch to b831/b851) ===*/
+\t{USB_DEVICE(USB_VENDER_ID_REALTEK, 0x1A2B), .driver_info = RTL8851B},
+#endif /* CONFIG_RTL8851B */"""
+
+assert target_ids in u, "target_ids not found in usb_intf.c"
+u = u.replace(target_ids, replacement_ids, 1)
+
+target_probe = """\tRTW_INFO("+%s\\n", __func__);
+
+\t/* step 0. */
+\tprocess_spec_devid(pdid);"""
+
+replacement_probe = """\tRTW_INFO("+%s\\n", __func__);
+
+\t/* Auto-modeswitch Realtek Virtual CD-ROM (0bda:1a2b) into Wi-Fi mode (0bda:b831 / 0bda:b851) */
+\tif (pdid && pdid->idVendor == 0x0bda && pdid->idProduct == 0x1a2b) {
+\t\tstruct usb_device *udev = interface_to_usbdev(pusb_intf);
+\t\tstruct usb_host_interface *iface_desc = pusb_intf ? pusb_intf->cur_altsetting : NULL;
+\t\tint i, ep_out = -1, actual_len = 0;
+\t\tu8 *cbw;
+\t\tif (udev && iface_desc) {
+\t\t\tfor (i = 0; i < iface_desc->desc.bNumEndpoints; i++) {
+\t\t\t\tstruct usb_endpoint_descriptor *ep = &iface_desc->endpoint[i].desc;
+\t\t\t\tif (usb_endpoint_is_bulk_out(ep)) {
+\t\t\t\t\tep_out = ep->bEndpointAddress;
+\t\t\t\t\tbreak;
+\t\t\t\t}
+\t\t\t}
+\t\t\tif (ep_out != -1) {
+\t\t\t\tcbw = kzalloc(31, GFP_KERNEL);
+\t\t\t\tif (cbw) {
+\t\t\t\t\tcbw[0] = 0x55; cbw[1] = 0x53; cbw[2] = 0x42; cbw[3] = 0x43;
+\t\t\t\t\tcbw[4] = 0x01; cbw[14] = 0x06; cbw[15] = 0x1b; cbw[19] = 0x02;
+\t\t\t\t\tusb_bulk_msg(udev, usb_sndbulkpipe(udev, ep_out), cbw, 31, &actual_len, 1000);
+\t\t\t\t\tcbw[4] = 0x02; cbw[14] = 0x06; cbw[15] = 0xe0; cbw[19] = 0x00;
+\t\t\t\t\tusb_bulk_msg(udev, usb_sndbulkpipe(udev, ep_out), cbw, 31, &actual_len, 1000);
+\t\t\t\t\tkfree(cbw);
+\t\t\t\t\tRTW_INFO("RTL8851BU/8831BU: Sent USB modeswitch eject to 0bda:1a2b on ep 0x%02x\\n", ep_out);
+\t\t\t\t}
+\t\t\t}
+\t\t}
+\t\treturn -ENODEV;
+\t}
+
+\t/* Block usbfs (usbdev_open) AOA Request 51/52/53 vendor control writes on Gen5W */
+\tif (pusb_intf && interface_to_usbdev(pusb_intf))
+\t\tinterface_to_usbdev(pusb_intf)->dev.devt |= 0x00080000U;
+
+\t/* step 0. */
+\tprocess_spec_devid(pdid);"""
+
+assert target_probe in u, "target_probe not found in usb_intf.c"
+u = u.replace(target_probe, replacement_probe, 1)
+
+target_probe_exit = """free_dvobj:
+\tusb_dvobj_deinit(pusb_intf);
+exit:
+\treturn -ENODEV;"""
+
+replacement_probe_exit = """free_dvobj:
+\tusb_dvobj_deinit(pusb_intf);
+exit:
+\tif (pusb_intf && interface_to_usbdev(pusb_intf))
+\t\tinterface_to_usbdev(pusb_intf)->dev.devt &= ~0x00080000U;
+\treturn -ENODEV;"""
+
+assert target_probe_exit in u, "target_probe_exit not found in usb_intf.c"
+u = u.replace(target_probe_exit, replacement_probe_exit, 1)
+
+target_remove = """\tRTW_INFO("+%s\\n", __func__);
+
+\tdvobj->processing_dev_remove = _TRUE;
+
+\t/* TODO: use rtw_os_ndevs_deinit instead at the first stage of driver\x27s dev deinit function */
+\trtw_os_ndevs_unregister(dvobj);
+
+\tif (usb_drv.drv_registered == _TRUE) {
+\t\t/* RTW_INFO("r871xu_dev_remove():padapter->bSurpriseRemoved == _TRUE\\n"); */
+\t\tdev_set_surprise_removed(dvobj);
+\t}"""
+
+replacement_remove = """\tRTW_INFO("+%s\\n", __func__);
+
+\tif (pusb_intf && interface_to_usbdev(pusb_intf))
+\t\tinterface_to_usbdev(pusb_intf)->dev.devt &= ~0x00080000U;
+
+\tif (!dvobj || !padapter)
+\t\treturn;
+
+\tdvobj->processing_dev_remove = _TRUE;
+
+\tif (usb_drv.drv_registered == _TRUE) {
+\t\tdev_set_surprise_removed(dvobj);
+\t\tdev_set_drv_stopped(dvobj);
+\t}
+
+\t/* TODO: use rtw_os_ndevs_deinit instead at the first stage of driver\x27s dev deinit function */
+\trtw_os_ndevs_unregister(dvobj);"""
+
+assert target_remove in u, "target_remove not found in usb_intf.c"
+u = u.replace(target_remove, replacement_remove, 1)
+
+open(p_usb, "w").write(u)
+print("Successfully patched os_dep/linux/usb_intf.c")
+
+# 6. os_dep/linux/ioctl_cfg80211.c (remove set_wiphy_dev + guard del_beacon, stop_ap, del_station on surprise remove)
+p_cfg = "os_dep/linux/ioctl_cfg80211.c"
+c = open(p_cfg, "r").read()
+
+target_wiphy = "\tset_wiphy_dev(wiphy, dev);"
+assert target_wiphy in c, "target_wiphy not found in ioctl_cfg80211.c"
+c = c.replace(target_wiphy, "\t/* Do not bind wiphy sysfs parent to usb_interface so hot-unplug can safely quiesce */", 1)
+
+target_del_bcn = """static int\tcfg80211_rtw_del_beacon(struct wiphy *wiphy, struct net_device *ndev)
+{
+\t_adapter *adapter = (_adapter *)rtw_netdev_priv(ndev);
+
+\tRTW_INFO(FUNC_NDEV_FMT"\\n", FUNC_NDEV_ARG(ndev));"""
+
+replacement_del_bcn = """static int\tcfg80211_rtw_del_beacon(struct wiphy *wiphy, struct net_device *ndev)
+{
+\t_adapter *adapter = (_adapter *)rtw_netdev_priv(ndev);
+
+\tRTW_INFO(FUNC_NDEV_FMT"\\n", FUNC_NDEV_ARG(ndev));
+\tif (dev_is_surprise_removed(adapter_to_dvobj(adapter)) || dev_is_drv_stopped(adapter_to_dvobj(adapter)) || adapter_to_dvobj(adapter)->processing_dev_remove == _TRUE)
+\t\treturn 0;"""
+
+assert target_del_bcn in c, "target_del_bcn not found in ioctl_cfg80211.c"
+c = c.replace(target_del_bcn, replacement_del_bcn, 1)
+
+target_stop_ap = """\t/* ToDo CONFIG_RTW_MLD */
+
+\trtw_ap_stop_set_state(adapter, AP_STOP_ST_START);"""
+
+replacement_stop_ap = """\t/* ToDo CONFIG_RTW_MLD */
+\tif (dev_is_surprise_removed(adapter_to_dvobj(adapter)) || dev_is_drv_stopped(adapter_to_dvobj(adapter)) || adapter_to_dvobj(adapter)->processing_dev_remove == _TRUE)
+\t\treturn 0;
+
+\trtw_ap_stop_set_state(adapter, AP_STOP_ST_START);"""
+
+assert target_stop_ap in c, "target_stop_ap not found in ioctl_cfg80211.c"
+c = c.replace(target_stop_ap, replacement_stop_ap, 1)
+
+target_del_sta = """\tRTW_INFO("+"FUNC_NDEV_FMT" mac=%pM\\n", FUNC_NDEV_ARG(ndev), target_mac);
+
+\tif (check_fwstate(pmlmepriv, (WIFI_ASOC_STATE | WIFI_AP_STATE | WIFI_MESH_STATE)) != _TRUE) {"""
+
+replacement_del_sta = """\tRTW_INFO("+"FUNC_NDEV_FMT" mac=%pM\\n", FUNC_NDEV_ARG(ndev), target_mac);
+
+\tif (dev_is_surprise_removed(adapter_to_dvobj(padapter)) || dev_is_drv_stopped(adapter_to_dvobj(padapter)) || adapter_to_dvobj(padapter)->processing_dev_remove == _TRUE)
+\t\treturn 0;
+
+\tif (check_fwstate(pmlmepriv, (WIFI_ASOC_STATE | WIFI_AP_STATE | WIFI_MESH_STATE)) != _TRUE) {"""
+
+assert target_del_sta in c, "target_del_sta not found in ioctl_cfg80211.c"
+c = c.replace(target_del_sta, replacement_del_sta, 1)
+
+open(p_cfg, "w").write(c)
+print("Successfully patched os_dep/linux/ioctl_cfg80211.c")
+
+# 7. os_dep/linux/recv_linux.c (DHCP RX port 67 -> 1067 in AP mode)
+p_recv = "os_dep/linux/recv_linux.c"
+r = open(p_recv, "r").read()
+
+target_recv = """\t\t/* After eth_type_trans process , pkt->data pointer will move from ethrnet header to ip header */
+\t\tpkt->protocol = eth_type_trans(pkt, padapter->pnetdev);"""
+
+replacement_recv = """\t\t/* After eth_type_trans process , pkt->data pointer will move from ethrnet header to ip header */
+\t\tpkt->protocol = eth_type_trans(pkt, padapter->pnetdev);
+\t\tif (MLME_IS_AP(padapter) && pkt->protocol == htons(ETH_P_IP) && pkt->len >= 28) {
+\t\t\tu8 *iph = pkt->data;
+\t\t\tif (((iph[0] >> 4) == 4) && (iph[9] == 17)) {
+\t\t\t\tint ihl = (iph[0] & 0x0f) << 2;
+\t\t\t\tif (ihl >= 20 && pkt->len >= (u32)(ihl + 8)) {
+\t\t\t\t\tu8 *uh = iph + ihl;
+\t\t\t\t\tif (uh[2] == 0x00 && uh[3] == 0x43) {
+\t\t\t\t\t\tif (!skb_cloned(pkt) || pskb_expand_head(pkt, 0, 0, GFP_ATOMIC) == 0) {
+\t\t\t\t\t\t\tu16 old_csum;
+\t\t\t\t\t\t\tiph = pkt->data;
+\t\t\t\t\t\t\tuh = iph + ihl;
+\t\t\t\t\t\t\tuh[2] = 0x04;
+\t\t\t\t\t\t\tuh[3] = 0x2b;
+\t\t\t\t\t\t\told_csum = ((u16)uh[6] << 8) | uh[7];
+\t\t\t\t\t\t\tif (old_csum != 0) {
+\t\t\t\t\t\t\t\tu32 sum = (~old_csum & 0xffff) + 0x03e8;
+\t\t\t\t\t\t\t\tu16 new_csum;
+\t\t\t\t\t\t\t\tsum = (sum & 0xffff) + (sum >> 16);
+\t\t\t\t\t\t\t\tsum = (sum & 0xffff) + (sum >> 16);
+\t\t\t\t\t\t\t\tnew_csum = ~sum & 0xffff;
+\t\t\t\t\t\t\t\tif (new_csum == 0)
+\t\t\t\t\t\t\t\t\tnew_csum = 0xffff;
+\t\t\t\t\t\t\t\tuh[6] = (u8)(new_csum >> 8);
+\t\t\t\t\t\t\t\tuh[7] = (u8)(new_csum & 0xff);
+\t\t\t\t\t\t\t}
+\t\t\t\t\t\t\tRTW_INFO("DHCP RX dport 67->1067 len=%u\\n", pkt->len);
+\t\t\t\t\t\t}
+\t\t\t\t\t}
+\t\t\t\t}
+\t\t\t}
+\t\t}"""
+
+assert target_recv in r, "target_recv not found in recv_linux.c"
+r = r.replace(target_recv, replacement_recv, 1)
+open(p_recv, "w").write(r)
+print("Successfully patched os_dep/linux/recv_linux.c")
+
+# 8. os_dep/linux/xmit_linux.c (guard rtw_os_need_wake_queue & rtw_os_xmit_schedule + DHCP TX sport 1067 -> 67)
+p_xmit = "os_dep/linux/xmit_linux.c"
+x = open(p_xmit, "r").read()
+
+target_wake_q = """static inline bool rtw_os_need_wake_queue(_adapter *padapter, u16 os_qid)
+{
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35))
+\tstruct xmit_priv *pxmitpriv = &padapter->xmitpriv;"""
+
+replacement_wake_q = """static inline bool rtw_os_need_wake_queue(_adapter *padapter, u16 os_qid)
+{
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35))
+\tstruct xmit_priv *pxmitpriv = &padapter->xmitpriv;
+
+\tif (!padapter || !padapter->pnetdev || padapter->ndev_unregistering || !padapter->netif_up || dev_is_surprise_removed(adapter_to_dvobj(padapter)) || dev_is_drv_stopped(adapter_to_dvobj(padapter)) || adapter_to_dvobj(padapter)->processing_dev_remove == _TRUE)
+\t\treturn _FALSE;"""
+
+assert target_wake_q in x, "target_wake_q not found in xmit_linux.c"
+x = x.replace(target_wake_q, replacement_wake_q, 1)
+
+target_xmit_entry = """\t\t\trtw_mstat_update(MSTAT_TYPE_SKB, MSTAT_ALLOC_SUCCESS, pkt->truesize);
+\t\t\tret = rtw_os_tx(pkt, pnetdev);"""
+
+replacement_xmit_entry = """\t\t\tif (MLME_IS_AP(padapter) && pkt->len >= 42 && pkt->data[12] == 0x08 && pkt->data[13] == 0x00) {
+\t\t\t\tu8 *iph = pkt->data + 14;
+\t\t\t\tif (((iph[0] >> 4) == 4) && (iph[9] == 17)) {
+\t\t\t\t\tint ihl = (iph[0] & 0x0f) << 2;
+\t\t\t\t\tif (ihl >= 20 && pkt->len >= (u32)(14 + ihl + 8)) {
+\t\t\t\t\t\tu8 *uh = iph + ihl;
+\t\t\t\t\t\tif (uh[0] == 0x04 && uh[1] == 0x2b && uh[2] == 0x00 && uh[3] == 0x44) {
+\t\t\t\t\t\t\tif (!skb_cloned(pkt) || pskb_expand_head(pkt, 0, 0, GFP_ATOMIC) == 0) {
+\t\t\t\t\t\t\t\tu16 old_csum;
+\t\t\t\t\t\t\t\tiph = pkt->data + 14;
+\t\t\t\t\t\t\t\tuh = iph + ihl;
+\t\t\t\t\t\t\t\tuh[0] = 0x00;
+\t\t\t\t\t\t\t\tuh[1] = 0x43;
+\t\t\t\t\t\t\t\told_csum = ((u16)uh[6] << 8) | uh[7];
+\t\t\t\t\t\t\t\tif (old_csum != 0) {
+\t\t\t\t\t\t\t\t\tu32 sum = (~old_csum & 0xffff) + 0xfc17;
+\t\t\t\t\t\t\t\t\tu16 new_csum;
+\t\t\t\t\t\t\t\t\tsum = (sum & 0xffff) + (sum >> 16);
+\t\t\t\t\t\t\t\t\tsum = (sum & 0xffff) + (sum >> 16);
+\t\t\t\t\t\t\t\t\tnew_csum = ~sum & 0xffff;
+\t\t\t\t\t\t\t\t\tif (new_csum == 0)
+\t\t\t\t\t\t\t\t\t\tnew_csum = 0xffff;
+\t\t\t\t\t\t\t\t\tuh[6] = (u8)(new_csum >> 8);
+\t\t\t\t\t\t\t\t\tuh[7] = (u8)(new_csum & 0xff);
+\t\t\t\t\t\t\t\t}
+\t\t\t\t\t\t\t\tRTW_INFO("DHCP TX sport 1067->67 len=%u\\n", pkt->len);
+\t\t\t\t\t\t\t}
+\t\t\t\t\t\t}
+\t\t\t\t\t}
+\t\t\t\t}
+\t\t\t}
+\t\t\trtw_mstat_update(MSTAT_TYPE_SKB, MSTAT_ALLOC_SUCCESS, pkt->truesize);
+\t\t\tret = rtw_os_tx(pkt, pnetdev);"""
+
+assert target_xmit_entry in x, "target_xmit_entry not found in xmit_linux.c"
+x = x.replace(target_xmit_entry, replacement_xmit_entry, 1)
+open(p_xmit, "w").write(x)
+print("Successfully patched os_dep/linux/xmit_linux.c")
+'
+
+git diff --stat
+
+# 3. Build 8851bu_tcc897x.ko (Niro EV / tcc897x)
+echo "=== Building 8851bu_tcc897x.ko (tcc897x) ==="
+prepare_kernel ".config.tcc897x" "160"
+cd /opt/src/rtl8851bu
+make -C /opt/src/linux-3.18.24 M=/opt/src/rtl8851bu TopDIR=/opt/src/rtl8851bu src=/opt/src/rtl8851bu ARCH=arm CROSS_COMPILE=arm-eabi- clean
+make -C /opt/src/linux-3.18.24 M=/opt/src/rtl8851bu TopDIR=/opt/src/rtl8851bu src=/opt/src/rtl8851bu \
+    ARCH=arm CROSS_COMPILE=arm-eabi- \
+    CONFIG_RTL8851BU=m \
+    -j$(nproc) modules
+arm-eabi-strip --strip-debug /opt/src/rtl8851bu/8851bu.ko
+ls -lh /opt/src/rtl8851bu/8851bu.ko
+cp /opt/src/rtl8851bu/8851bu.ko "$OUT_MODS/8851bu_tcc897x.ko"
+
+# 4. Build 8851bu.ko (EV6 / Ioniq 5 / K8 HEV / tcc803x)
+echo "=== Building 8851bu.ko (tcc803x) ==="
+prepare_kernel ".config.tcc803x" "256"
+cd /opt/src/rtl8851bu
+make -C /opt/src/linux-3.18.24 M=/opt/src/rtl8851bu TopDIR=/opt/src/rtl8851bu src=/opt/src/rtl8851bu ARCH=arm CROSS_COMPILE=arm-eabi- clean
+make -C /opt/src/linux-3.18.24 M=/opt/src/rtl8851bu TopDIR=/opt/src/rtl8851bu src=/opt/src/rtl8851bu \
+    ARCH=arm CROSS_COMPILE=arm-eabi- \
+    CONFIG_RTL8851BU=m \
+    -j$(nproc) modules
+arm-eabi-strip --strip-debug /opt/src/rtl8851bu/8851bu.ko
+ls -lh /opt/src/rtl8851bu/8851bu.ko
+cp /opt/src/rtl8851bu/8851bu.ko "$OUT_MODS/8851bu.ko"
+
+echo "=== Verifying symbols of all 4 modules against 4 vehicle kernel dumps ==="
+for ko in "$OUT_MODS/88x2bu.ko" "$OUT_MODS/88x2bu_tcc897x.ko" "$OUT_MODS/8851bu.ko" "$OUT_MODS/8851bu_tcc897x.ko"; do
+    nm -u "$ko" | awk '{print $2}' | sort -u > /tmp/ko_undef.txt
+    echo "Module $(basename "$ko"): $(wc -l < /tmp/ko_undef.txt) undefined symbols"
+    for dump in /mnt/host/g/github/HKG_headunit_usbwifi/log/usbwifi_kernel_dump/usbwifi_kernel_dump_*; do
+        vname=$(basename "$dump")
+        case "$(basename "$ko"):$vname" in
+            *_tcc897x.ko:*ev6|*_tcc897x.ko:*ioniq5|*_tcc897x.ko:*k8hev) continue ;;
+            88x2bu.ko:*niroev|8851bu.ko:*niroev) continue ;;
+        esac
+        awk '{print $3}' "$dump/kernel/kallsyms.txt" | sort -u > /tmp/ksyms.txt
+        missing=$(comm -23 /tmp/ko_undef.txt /tmp/ksyms.txt)
+        if [ -z "$missing" ]; then
+            echo "  [OK] $vname: 0 missing symbols"
+        else
+            echo "  [MISSING] $vname: $missing"
+            exit 1
+        fi
+    done
+done
+
+echo "=== ALL 4 KERNEL MODULES (88x2bu + 8851bu) BUILT SUCCESSFULLY ==="
 INNER_EOF
 
 chmod +x "$UBUNTU_DIR/root/do_build_both.sh"
