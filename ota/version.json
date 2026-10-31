@@ -1,9 +1,9 @@
 {
-  "version": "2.0.1",
+  "version": "2.0.2",
   "repo": "GRT47/HKG_5W_USB_Wlan",
   "branch": "main",
-  "sha256_jar": "cf7632d4f5d455f5726222e45b01f19733c7143fe200ce44badbdccda3562166",
-  "sha256_daemon": "fdfd7cf90dfbbefda10bcbe95b746bcc69ef2b708bd5fd42a431f4bac45edb6c",
+  "sha256_jar": "45025b7359cee448c423a2119da43da99d039bb5e36cfc9db8876947353403fe",
+  "sha256_daemon": "de2b6cf08c95933a186a6d41225e20ba05e596c18348befd2485ce371e467b71",
   "sha256_launch": "f178706c82d54480db7ed44041ffeaa2e9ea3e958ac1600dc850a4d385c4f9f4",
-  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (RTL8812BU/8822BU + RTL8831BU/8851BU Support + MAP Long-Press Auto-Daemon & Z-Order Fix)"
+  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.2: Fix STA disconnect kill_pid_file, dnsmasq.fifo race, STA 5GHz scan & disconnect reconnect, stale boot trigger, 8851bu module params)"
 }

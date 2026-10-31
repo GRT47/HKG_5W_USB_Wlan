@@ -53,7 +53,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class UsbWifiStatusMain {
 
-    public static final String UI_VERSION = "2.0.1";
+    public static final String UI_VERSION = "2.0.2";
     public static final String GITHUB_RAW_HOST = "raw.githubusercontent.com";
     public static final String GITHUB_OTA_BASE_PATH = "/GRT47/HKG_5W_USB_Wlan/main/ota";
     private static final Charset UTF8 = Charset.forName("UTF-8");
@@ -2754,7 +2754,7 @@ public class UsbWifiStatusMain {
                 public void run() {
                     try {
                         writeBytesAtomic(new File(TMP_DIR_PATH, "trigger_scan"), "1\n".getBytes(UTF8));
-                        Thread.sleep(2500L);
+                        Thread.sleep(4500L);
                         latestSnapshot = collectSnapshot(installDir);
                         actionBannerMsg = "✅ 주변 Wi-Fi 검색 완료! 연결할 네트워크를 터치하세요.";
                     } catch (Throwable ignored) {

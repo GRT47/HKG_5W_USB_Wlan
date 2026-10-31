@@ -60,6 +60,8 @@ done
 # Force stdout/stderr to daemon_stdout.log even when NEMESIS launches service with /dev/null
 exec >>"$TMP_DIR/daemon_stdout.log" 2>&1
 echo "$$" > "$TMP_DIR/daemon.pid" 2>/dev/null
+# Clear any stale one-shot trigger files left over across reboots
+rm -f "$TMP_DIR/force_restart" "$TMP_DIR/ota_reload_daemon" "$TMP_DIR/trigger_scan" "$TMP_DIR/disconnect_sta" 2>/dev/null
 
 load_config() {
     USB_VID="0bda"
@@ -118,6 +120,20 @@ sync_logs_to_usb() {
         dmesg > "$_ulog/dmesg_latest.txt" 2>/dev/null
         sync
     fi
+}
+
+kill_pid_file() {
+    local _pf="$1" _kpid _w
+    [ -n "$_pf" ] && [ -f "$_pf" ] || return 0
+    read -r _kpid < "$_pf" 2>/dev/null
+    if [ -n "$_kpid" ] && [ -d "/proc/$_kpid" ]; then
+        kill "$_kpid" 2>/dev/null
+        for _w in 1 2 3; do
+            [ -d "/proc/$_kpid" ] || break
+            sleep 1
+        done
+    fi
+    rm -f "$_pf" 2>/dev/null
 }
 
 stop_sta_daemons() {
@@ -340,16 +356,27 @@ load_single_ko() {
         return 0
     fi
     _plat="$(getprop ro.board.platform 2>/dev/null)"
+    if [ -z "$_plat" ]; then
+        if grep -qi "tcc803" /proc/cpuinfo /proc/cmdline 2>/dev/null; then
+            _plat="tcc803x"
+        else
+            _plat="tcc897x"
+        fi
+    fi
     _target_ko="$MOD_DIR/${_mbase}.ko"
     if [ -n "$_plat" ] && [ -f "$MOD_DIR/${_mbase}_${_plat}.ko" ]; then
         _target_ko="$MOD_DIR/${_mbase}_${_plat}.ko"
     fi
     [ -f "$_target_ko" ] || return 1
-    _all_args="$MODULE_ARGS"
-    case "$_all_args" in
-        *ifname=*) ;;
-        *) _all_args="$_all_args ifname=rtwlan%d if2name=rtwlan%d" ;;
-    esac
+    if [ "$_mbase" = "8851bu" ]; then
+        _all_args="ifname=rtwlan%d if2name=rtwlan%d"
+    else
+        _all_args="$MODULE_ARGS"
+        case "$_all_args" in
+            *ifname=*) ;;
+            *) _all_args="$_all_args ifname=rtwlan%d if2name=rtwlan%d" ;;
+        esac
+    fi
     log_info "Loading kernel module ${_target_ko##*/} ($_all_args) on $_plat"
     insmod "$_target_ko" $_all_args >>"$TMP_DIR/insmod.log" 2>&1
     if ! grep -q "^${_mbase} " /proc/modules 2>/dev/null; then
@@ -604,7 +631,12 @@ EOF
 
     rm -f "$TMP_DIR/dnsmasq.fifo" 2>/dev/null
     mknod "$TMP_DIR/dnsmasq.fifo" p 2>/dev/null || mkfifo "$TMP_DIR/dnsmasq.fifo" 2>/dev/null
-    ( while true; do sleep 3600; done ) > "$TMP_DIR/dnsmasq.fifo" &
+    if [ ! -p "$TMP_DIR/dnsmasq.fifo" ]; then
+        echo -n "update_ifaces:$_iface" > "$TMP_DIR/dnsmasq.fifo" 2>/dev/null
+        ( while true; do sleep 3600; done ) >> "$TMP_DIR/dnsmasq.fifo" &
+    else
+        ( while true; do sleep 3600; done ) > "$TMP_DIR/dnsmasq.fifo" &
+    fi
     echo $! > "$TMP_DIR/dnsmasq_stdin.pid"
     if [ "$ENABLE_LTE_NAT" = "1" ]; then
         /system/bin/dnsmasq --keep-in-foreground --no-resolv --no-poll --port=0 \
@@ -628,7 +660,7 @@ EOF
             --pid-file="$TMP_DIR/dnsmasq.pid" < "$TMP_DIR/dnsmasq.fifo" >>"$TMP_DIR/dnsmasq.log" 2>&1 &
     fi
     sleep 1
-    echo -n "update_ifaces:$_iface" > "$TMP_DIR/dnsmasq.fifo" 2>/dev/null
+    [ -p "$TMP_DIR/dnsmasq.fifo" ] && echo -n "update_ifaces:$_iface" > "$TMP_DIR/dnsmasq.fifo" 2>/dev/null
 
     log_info "SoftAP active on $_iface ($_ip/$AP_PREFIX, SSID=$AP_SSID, DNS=$_dns_list)"
     save_active_snapshot
@@ -658,7 +690,6 @@ start_sta_on_iface() {
     mkdir -p "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
     cat > "$WIFI_WORK_DIR/wpa_supplicant.conf" <<EOF
 ctrl_interface=$WIFI_WORK_DIR/wpa_ctrl
-update_config=1
 ap_scan=1
 EOF
     if [ -n "$STA_SSID" ]; then
@@ -682,15 +713,14 @@ network={
 }
 EOF
         fi
-    fi
-    if [ -f "$SAVED_STA_FILE" ]; then
-        while IFS='=' read -r _s_ssid _s_pass; do
-            [ -n "$_s_ssid" ] || continue
-            [ "$_s_ssid" = "$STA_SSID" ] && continue
-            _prio=$((_prio - 10))
-            [ "$_prio" -lt 10 ] && _prio=10
-            if [ -n "$_s_pass" ]; then
-                cat >> "$WIFI_WORK_DIR/wpa_supplicant.conf" <<EOF
+        if [ -f "$SAVED_STA_FILE" ]; then
+            while IFS='=' read -r _s_ssid _s_pass; do
+                [ -n "$_s_ssid" ] || continue
+                [ "$_s_ssid" = "$STA_SSID" ] && continue
+                _prio=$((_prio - 10))
+                [ "$_prio" -lt 10 ] && _prio=10
+                if [ -n "$_s_pass" ]; then
+                    cat >> "$WIFI_WORK_DIR/wpa_supplicant.conf" <<EOF
 network={
     ssid="$_s_ssid"
     scan_ssid=1
@@ -699,8 +729,9 @@ network={
     priority=$_prio
 }
 EOF
-            fi
-        done < "$SAVED_STA_FILE"
+                fi
+            done < "$SAVED_STA_FILE"
+        fi
     fi
     chown -R 1010:1010 "$WIFI_WORK_DIR" 2>/dev/null
     chmod 777 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
@@ -713,17 +744,24 @@ EOF
 
     /system/bin/wpa_supplicant -Dnl80211 -i"$_iface" -c"$WIFI_WORK_DIR/wpa_supplicant.conf" >>"$TMP_DIR/wpa_supplicant.log" 2>&1 &
     echo $! > "$TMP_DIR/wpa_supplicant.pid"
-    sleep 2
-    for _rproc in "/proc/net/rtl88x2bu/$_iface" "/proc/net/rtl8851bu/$_iface"; do
-        [ -w "$_rproc/survey_info" ] && echo 1 > "$_rproc/survey_info" 2>/dev/null
-    done
-    [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" scan >/dev/null 2>&1
-    sleep 2
+    if [ -z "$STA_SSID" ]; then
+        sleep 1
+        for _rproc in "/proc/net/rtl88x2bu/$_iface" "/proc/net/rtl8851bu/$_iface"; do
+            [ -w "$_rproc/survey_info" ] && echo 1 > "$_rproc/survey_info" 2>/dev/null
+        done
+        [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" scan >/dev/null 2>&1
+        sleep 4
+    else
+        # When connecting to a target SSID, let wpa_supplicant perform its own nl80211 scan+associate
+        # without interrupting it via /proc/.../survey_info
+        sleep 4
+    fi
     for _rproc in "/proc/net/rtl88x2bu/$_iface" "/proc/net/rtl8851bu/$_iface"; do
         [ -f "$_rproc/survey_info" ] && cat "$_rproc/survey_info" > "$TMP_DIR/sta_survey.txt" 2>/dev/null
         [ -f "$_rproc/ap_info" ] && cat "$_rproc/ap_info" > "$TMP_DIR/sta_ap_info.txt" 2>/dev/null
         [ -f "$_rproc/rx_signal" ] && cat "$_rproc/rx_signal" > "$TMP_DIR/sta_rx_signal.txt" 2>/dev/null
     done
+    logcat -d -v time -s wpa_supplicant:V > "$TMP_DIR/wpa_supplicant.log" 2>/dev/null
     if [ -x /system/bin/wpa_cli ]; then
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" scan_results > "$TMP_DIR/sta_scan.txt" 2>/dev/null
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" status > "$TMP_DIR/wpa_status.txt" 2>/dev/null
@@ -747,6 +785,7 @@ is_sta_healthy() {
         [ -f "$_rproc/ap_info" ] && cat "$_rproc/ap_info" > "$TMP_DIR/sta_ap_info.txt" 2>/dev/null
         [ -f "$_rproc/rx_signal" ] && cat "$_rproc/rx_signal" > "$TMP_DIR/sta_rx_signal.txt" 2>/dev/null
     done
+    logcat -d -v time -s wpa_supplicant:V > "$TMP_DIR/wpa_supplicant.log" 2>/dev/null
     if [ -x /system/bin/wpa_cli ]; then
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" status > "$TMP_DIR/wpa_status.txt" 2>/dev/null
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" signal_poll > "$TMP_DIR/wpa_signal.txt" 2>/dev/null
@@ -792,12 +831,17 @@ is_sta_healthy() {
 }
 
 is_ap_healthy() {
-    local _iface="$1" _hpid _dpid
+    local _iface="$1" _hpid _dpid _hfd
     [ -n "$_iface" ] || return 1
     [ -d "/sys/class/net/$_iface" ] || return 1
     if [ -f "$TMP_DIR/hostapd.pid" ]; then
         read -r _hpid < "$TMP_DIR/hostapd.pid" 2>/dev/null
         [ -n "$_hpid" ] && [ -d "/proc/$_hpid" ] || return 1
+        _hfd="$(readlink "/proc/$_hpid/fd/1" 2>/dev/null)"
+        case "$_hfd" in
+            *usbwifi_hotspot/hostapd.log*) ;;
+            *) return 1 ;;
+        esac
     else
         return 1
     fi
@@ -816,11 +860,14 @@ is_ap_healthy() {
 }
 
 ensure_ui_daemon_running() {
-    local _upid _ui_alive=0
+    local _upid _ui_alive=0 _ufd
     if [ -f "$TMP_DIR/ui_java.pid" ]; then
         read -r _upid < "$TMP_DIR/ui_java.pid" 2>/dev/null
         if [ -n "$_upid" ] && [ -d "/proc/$_upid" ] && kill -0 "$_upid" 2>/dev/null; then
-            _ui_alive=1
+            _ufd="$(readlink "/proc/$_upid/fd/1" 2>/dev/null)"
+            case "$_ufd" in
+                *usbwifi_hotspot/ui.log*) _ui_alive=1 ;;
+            esac
         fi
     fi
     if [ "$_ui_alive" = "0" ]; then
@@ -867,7 +914,7 @@ while true; do
                 [ -w "$_rproc/survey_info" ] && echo 1 > "$_rproc/survey_info" 2>/dev/null
             done
             [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$ACTIVE_IFACE" scan >/dev/null 2>&1
-            sleep 2
+            sleep 4
             for _rproc in "/proc/net/rtl88x2bu/$ACTIVE_IFACE" "/proc/net/rtl8851bu/$ACTIVE_IFACE"; do
                 [ -f "$_rproc/survey_info" ] && cat "$_rproc/survey_info" > "$TMP_DIR/sta_survey.txt" 2>/dev/null
             done
@@ -876,19 +923,11 @@ while true; do
     fi
     if [ -f "$TMP_DIR/disconnect_sta" ]; then
         rm -f "$TMP_DIR/disconnect_sta" 2>/dev/null
+        load_config
         if [ -n "$ACTIVE_IFACE" ]; then
-            if [ -x /system/bin/wpa_cli ]; then
-                /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$ACTIVE_IFACE" disconnect >/dev/null 2>&1
-                /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$ACTIVE_IFACE" status > "$TMP_DIR/wpa_status.txt" 2>/dev/null
-            else
-                kill_pid_file "$TMP_DIR/wpa_supplicant.pid"
-                rm -f "$TMP_DIR/sta_ap_info.txt" "$TMP_DIR/wpa_status.txt" 2>/dev/null
-            fi
-            kill_pid_file "$TMP_DIR/dhcpcd.pid"
+            stop_sta_daemons
+            rm -f "$TMP_DIR/sta_ap_info.txt" "$TMP_DIR/wpa_status.txt" 2>/dev/null
             ip -4 addr flush dev "$ACTIVE_IFACE" >/dev/null 2>&1
-            ip rule del pref 9790 2>/dev/null
-            ip rule del pref 9800 2>/dev/null
-            ip route flush table 62 2>/dev/null
         fi
     fi
     if is_usb_dongle_present; then
