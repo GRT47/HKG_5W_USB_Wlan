@@ -1,9 +1,9 @@
 {
-  "version": "2.0.3",
+  "version": "2.0.4",
   "repo": "GRT47/HKG_5W_USB_Wlan",
   "branch": "main",
-  "sha256_jar": "cf4109c5b10308df75be6408f594be3e2d47d86f5eefa22168a5f5c0a8465597",
-  "sha256_daemon": "524f8d2f341bdc18c47cb92c77e15f7f6deabfd56ef9e8f8a954dbcc4b13ae05",
+  "sha256_jar": "3f8cc5018285c53043f95a5f462d85b60a98f24d13bf5f5ce8a119801bf28ff4",
+  "sha256_daemon": "3aa1f67b3c12978239536afd64db7690ba47183e585250c15b5101b11043a7d9",
   "sha256_launch": "f178706c82d54480db7ed44041ffeaa2e9ea3e958ac1600dc850a4d385c4f9f4",
-  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.3: Safe hotspot.conf parsing (SSIDs with spaces/special chars), UTF-8 STA SSIDs, dnsmasq.fifo hang fix, passphrase masking & file permissions, NAT/route cleanup, lower STA polling I/O)"
+  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.4: Fix v2.0.3 regression where hostapd/wpa_supplicant could not read their config (Permission denied), fix garbled STA scan SSIDs/security on 8851bu survey_info)"
 }

@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.3)
+# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.4)
 export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin
 export LD_LIBRARY_PATH=/vendor/lib:/system/lib
 export ANDROID_ROOT=/system
@@ -18,7 +18,8 @@ TMP_DIR="/data/local/tmp/usbwifi_hotspot"
 WIFI_WORK_DIR="/data/misc/wifi/usbwifi_hotspot"
 mkdir -p "$TMP_DIR" "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/ctrl" "$WIFI_WORK_DIR/wpa_ctrl" /data/dalvik-cache 2>/dev/null
 chmod 777 /data/local /data/local/tmp "$TMP_DIR" "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/ctrl" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
-chown -R 1010:1010 "$WIFI_WORK_DIR" 2>/dev/null
+# Directories only: hostapd.conf / wpa_supplicant.conf must stay owned by the daemon's own uid
+chown 1010:1010 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/ctrl" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
 touch /data/local/tmp/usb_sta.list 2>/dev/null
 chown 1010:1010 /data/local/tmp/usb_sta.list 2>/dev/null
 chmod 666 /data/local/tmp/usb_sta.list 2>/dev/null
@@ -175,6 +176,20 @@ kill_pid_file() {
         done
     fi
     rm -f "$_pf" 2>/dev/null
+}
+
+# Make a passphrase-bearing config private (0600, owned by us) WITHOUT ever making it unreadable
+# for hostapd/wpa_supplicant: they inherit our credentials, and NEMESIS services may run without
+# CAP_DAC_OVERRIDE (v2.0.3 regression: 0660 owned by wifi -> "Failed to open config file: Permission denied").
+secure_conf_file() {
+    local _f="$1"
+    [ -f "$_f" ] || return 0
+    chmod 600 "$_f" 2>/dev/null
+    if ! cat "$_f" >/dev/null 2>&1; then
+        chmod 644 "$_f" 2>/dev/null
+        cat "$_f" >/dev/null 2>&1 || chmod 666 "$_f" 2>/dev/null
+        log_info "WARN: ${_f##*/} not readable as 0600 by daemon uid -> permissions relaxed"
+    fi
 }
 
 stop_sta_daemons() {
@@ -533,6 +548,8 @@ start_hotspot_on_iface() {
     if [ ! -f "$WIFI_WORK_DIR/entropy.bin" ]; then
         dd if=/dev/urandom of="$WIFI_WORK_DIR/entropy.bin" bs=256 count=1 >/dev/null 2>&1
     fi
+    # Recreate (not overwrite) so the file is owned by our own uid, which hostapd inherits
+    rm -f "$WIFI_WORK_DIR/hostapd.conf" 2>/dev/null
     cat > "$WIFI_WORK_DIR/hostapd.conf" <<EOF
 interface=$_iface
 driver=nl80211
@@ -546,14 +563,13 @@ wpa=2
 rsn_pairwise=CCMP
 wpa_passphrase=$AP_PASS
 EOF
-    chown -R 1010:1010 "$WIFI_WORK_DIR" 2>/dev/null
+    chown 1010:1010 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/ctrl" "$WIFI_WORK_DIR/entropy.bin" 2>/dev/null
     chmod 777 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/ctrl" "$TMP_DIR" 2>/dev/null
-    # hostapd.conf holds the AP passphrase: readable by root/wifi only (never world-readable)
-    chmod 660 "$WIFI_WORK_DIR/hostapd.conf" "$WIFI_WORK_DIR/entropy.bin" 2>/dev/null
-    chmod 666 /data/local/tmp/usb_sta.list 2>/dev/null
+    chmod 666 "$WIFI_WORK_DIR/entropy.bin" /data/local/tmp/usb_sta.list 2>/dev/null
+    secure_conf_file "$WIFI_WORK_DIR/hostapd.conf"
     rm -f "$TMP_DIR/hostapd.conf" 2>/dev/null
     cp "$WIFI_WORK_DIR/hostapd.conf" "$TMP_DIR/hostapd.conf" 2>/dev/null
-    chmod 600 "$TMP_DIR/hostapd.conf" 2>/dev/null
+    secure_conf_file "$TMP_DIR/hostapd.conf"
     touch "$TMP_DIR/hostapd.log" 2>/dev/null
     chmod 666 "$TMP_DIR/hostapd.log" 2>/dev/null
 
@@ -734,6 +750,8 @@ start_sta_on_iface() {
     ip -4 addr flush dev "$_iface" >/dev/null 2>&1
 
     mkdir -p "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
+    # Recreate (not overwrite) so the file is owned by our own uid, which wpa_supplicant inherits
+    rm -f "$WIFI_WORK_DIR/wpa_supplicant.conf" 2>/dev/null
     cat > "$WIFI_WORK_DIR/wpa_supplicant.conf" <<EOF
 ctrl_interface=$WIFI_WORK_DIR/wpa_ctrl
 ap_scan=1
@@ -779,13 +797,12 @@ EOF
             done < "$SAVED_STA_FILE"
         fi
     fi
-    chown -R 1010:1010 "$WIFI_WORK_DIR" 2>/dev/null
+    chown 1010:1010 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
     chmod 777 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
-    # wpa_supplicant.conf holds STA passwords: readable by root/wifi only (never world-readable)
-    chmod 660 "$WIFI_WORK_DIR/wpa_supplicant.conf" 2>/dev/null
+    secure_conf_file "$WIFI_WORK_DIR/wpa_supplicant.conf"
     rm -f "$TMP_DIR/wpa_supplicant.conf" 2>/dev/null
     cp "$WIFI_WORK_DIR/wpa_supplicant.conf" "$TMP_DIR/wpa_supplicant.conf" 2>/dev/null
-    chmod 600 "$TMP_DIR/wpa_supplicant.conf" 2>/dev/null
+    secure_conf_file "$TMP_DIR/wpa_supplicant.conf"
     iptables -D INPUT -i "$_iface" -j ACCEPT 2>/dev/null
     iptables -D OUTPUT -o "$_iface" -j ACCEPT 2>/dev/null
     iptables -I INPUT 1 -i "$_iface" -j ACCEPT 2>/dev/null

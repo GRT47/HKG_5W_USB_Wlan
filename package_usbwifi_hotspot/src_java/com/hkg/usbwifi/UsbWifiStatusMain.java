@@ -53,7 +53,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class UsbWifiStatusMain {
 
-    public static final String UI_VERSION = "2.0.3";
+    public static final String UI_VERSION = "2.0.4";
     public static final String GITHUB_RAW_HOST = "raw.githubusercontent.com";
     public static final String GITHUB_OTA_BASE_PATH = "/GRT47/HKG_5W_USB_Wlan/main/ota";
     private static final Charset UTF8 = Charset.forName("UTF-8");
@@ -606,25 +606,29 @@ public class UsbWifiStatusMain {
         for (File svf : surveyFiles) {
             if (!svf.isFile()) continue;
             List<String> svLines = readLinesQuick(svf, 80);
+            int chCol = 2;
+            int dbmCol = 4;
             for (String sl : svLines) {
                 String t = sl.trim();
-                if (t.isEmpty() || t.startsWith("index")) continue;
-                String[] cols = t.split("\\s+", 9);
-                if (cols.length >= 9 && cols[1].indexOf(':') > 0) {
-                    int ch = (int) parseLongSafe(cols[2], 1L);
-                    int sdbm = (int) parseLongSafe(cols[4], -75L);
-                    String flags = cols[7];
-                    String ssid = cols[8].trim();
-                    if (ssid.isEmpty() || ssid.startsWith("\\x00")) continue;
-                    ScanEntry existing = dedup.get(ssid);
-                    if (existing == null || sdbm > existing.rssi) {
-                        ScanEntry se = new ScanEntry();
-                        se.ssid = ssid;
-                        se.band = ch >= 36 ? "5G" : "2.4G";
-                        se.rssi = sdbm;
-                        se.secured = flags.contains("WPA") || flags.contains("WEP") || flags.contains("RSN");
-                        dedup.put(ssid, se);
-                    }
+                if (t.isEmpty()) continue;
+                if (t.startsWith("index")) {
+                    int[] hc = parseSurveyHeader(t);
+                    chCol = hc[0];
+                    dbmCol = hc[1];
+                    continue;
+                }
+                SurveyRow row = parseSurveyRow(t, chCol, dbmCol);
+                if (row == null) continue;
+                String ssid = row.ssid;
+                if (ssid.isEmpty() || ssid.startsWith("\\x00")) continue;
+                ScanEntry existing = dedup.get(ssid);
+                if (existing == null || row.dbm > existing.rssi) {
+                    ScanEntry se = new ScanEntry();
+                    se.ssid = ssid;
+                    se.band = row.ch >= 36 ? "5G" : "2.4G";
+                    se.rssi = row.dbm;
+                    se.secured = row.flags.contains("WPA") || row.flags.contains("WEP") || row.flags.contains("RSN");
+                    dedup.put(ssid, se);
                 }
             }
             if (!dedup.isEmpty()) break;
@@ -3450,6 +3454,73 @@ public class UsbWifiStatusMain {
         }
     }
 
+    /** One parsed row of the Realtek /proc/net/rtl*bu/<iface>/survey_info table. */
+    public static final class SurveyRow {
+        public int ch = 1;
+        public int dbm = -75;
+        public String flags = "";
+        public String ssid = "";
+    }
+
+    /**
+     * Column layout differs per driver, so read it from the header:
+     *   88x2bu: "index bssid ch RSSI SdBm Noise age flag ssid"
+     *   8851bu: "index bssid band ch RSSI SdBm Noise alpha2 age flag ssid"
+     * Returns {chColumn, dBmColumn}.
+     */
+    public static int[] parseSurveyHeader(String header) {
+        String[] h = header.trim().split("\\s+");
+        int ch = 2;
+        int dbm = 4;
+        for (int i = 0; i < h.length; i++) {
+            if ("ch".equalsIgnoreCase(h[i])) ch = i;
+            else if ("SdBm".equalsIgnoreCase(h[i])) dbm = i;
+        }
+        return new int[]{ch, dbm};
+    }
+
+    /**
+     * Parses a survey_info data row. The flag column is the first "[..][..]" token after the BSSID
+     * and everything after it is the SSID (which may contain spaces or start with '['). This does
+     * not depend on the number of columns, which varies between drivers (and data rows of 8851bu
+     * even carry one more token than its header names).
+     */
+    public static SurveyRow parseSurveyRow(String line, int chCol, int dbmCol) {
+        String t = line.trim();
+        List<int[]> spans = new ArrayList<int[]>();
+        int i = 0;
+        int n = t.length();
+        while (i < n) {
+            while (i < n && Character.isWhitespace(t.charAt(i))) i++;
+            if (i >= n) break;
+            int s = i;
+            while (i < n && !Character.isWhitespace(t.charAt(i))) i++;
+            spans.add(new int[]{s, i});
+        }
+        if (spans.size() < 3) return null;
+        String bssid = t.substring(spans.get(1)[0], spans.get(1)[1]);
+        if (bssid.indexOf(':') <= 0) return null;
+        int flagIdx = -1;
+        for (int k = 2; k < spans.size(); k++) {
+            String tok = t.substring(spans.get(k)[0], spans.get(k)[1]);
+            if (tok.matches("(\\[[^\\[\\]\\s]*\\])+")) {
+                flagIdx = k;
+                break;
+            }
+        }
+        if (flagIdx < 0) return null;
+        SurveyRow r = new SurveyRow();
+        r.flags = t.substring(spans.get(flagIdx)[0], spans.get(flagIdx)[1]);
+        r.ssid = (flagIdx + 1 < spans.size()) ? t.substring(spans.get(flagIdx + 1)[0]).trim() : "";
+        if (chCol > 1 && chCol < flagIdx) {
+            r.ch = (int) parseLongSafe(t.substring(spans.get(chCol)[0], spans.get(chCol)[1]), 1L);
+        }
+        if (dbmCol > 1 && dbmCol < flagIdx) {
+            r.dbm = (int) parseLongSafe(t.substring(spans.get(dbmCol)[0], spans.get(dbmCol)[1]), -75L);
+        }
+        return r;
+    }
+
     /** True if the value can be stored on a single KEY=VALUE line and in wpa_supplicant/hostapd configs. */
     public static boolean isSafeConfigValue(String s) {
         if (s == null) return false;
@@ -4647,6 +4718,30 @@ public class UsbWifiStatusMain {
         }
         if (isSafeConfigValue("a\nb") || !isSafeConfigValue("Galaxy $(x) `y`; z")) {
             throw new AssertionError("isSafeConfigValue failed");
+        }
+        // survey_info parsing: 8851bu layout (real rows from a Gen5W log, 2026-11-08)
+        int[] hc51 = parseSurveyHeader("index bssid             band ch  RSSI SdBm Noise alpha2   age   flag                             ssid");
+        SurveyRow r1 = parseSurveyRow("    1 00:e1:40:19:14:f7 2.4G   6  -86  -87     0     -- 0 42880 [WPA2][WEP][WPS][ESS][P]         janus_bb_gw200_1914F7", hc51[0], hc51[1]);
+        if (r1 == null || !"janus_bb_gw200_1914F7".equals(r1.ssid) || r1.ch != 6 || r1.dbm != -87 || !r1.flags.contains("WPA2")) {
+            throw new AssertionError("parseSurveyRow 8851bu failed: " + (r1 == null ? "null" : r1.ssid + "/" + r1.ch + "/" + r1.dbm));
+        }
+        SurveyRow r2 = parseSurveyRow("   12 b4:b6:86:b0:72:78 2.4G   5  -80  -80     0     -- 0 30290 [WPA2][WEP][WPS][ESS][P]         DIRECT-77-HP OfficeJet Pro 8710", hc51[0], hc51[1]);
+        if (r2 == null || !"DIRECT-77-HP OfficeJet Pro 8710".equals(r2.ssid)) {
+            throw new AssertionError("parseSurveyRow SSID with spaces failed");
+        }
+        SurveyRow r3 = parseSurveyRow("   21 ca:dd:6a:53:51:c7 2.4G  11  -85  -85     0     -- 0 29850 [WPA2][WEP][ESS][P]              [LG_CeilingCassette A/C]51c7", hc51[0], hc51[1]);
+        if (r3 == null || !"[LG_CeilingCassette A/C]51c7".equals(r3.ssid) || !"[WPA2][WEP][ESS][P]".equals(r3.flags)) {
+            throw new AssertionError("parseSurveyRow SSID starting with '[' failed");
+        }
+        SurveyRow r4 = parseSurveyRow("   16 2e:4e:e9:ae:6c:b5 2.4G  10  -72  -73     0     -- 0 29940 [WPA2][WEP][ESS][B]              ", hc51[0], hc51[1]);
+        if (r4 == null || !r4.ssid.isEmpty()) {
+            throw new AssertionError("parseSurveyRow hidden SSID failed");
+        }
+        // 88x2bu layout
+        int[] hc2b = parseSurveyHeader("index bssid              ch  RSSI SdBm Noise   age   flag          ssid");
+        SurveyRow r5 = parseSurveyRow("    1 66:7a:71:f2:09:db  149  -44  -45     0 29750 [WPA2][ESS]   Camellia 5G", hc2b[0], hc2b[1]);
+        if (r5 == null || !"Camellia 5G".equals(r5.ssid) || r5.ch != 149 || r5.dbm != -45) {
+            throw new AssertionError("parseSurveyRow 88x2bu failed");
         }
 
         // Self-test MapButtonLongPressMonitor (3.0-second MAP button hold detector)

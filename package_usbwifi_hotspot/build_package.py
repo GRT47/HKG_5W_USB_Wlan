@@ -372,7 +372,7 @@ def build() -> None:
         "if [ -d /storage/usb0 ]; then\n"
         "    ULOG=\"/storage/usb0/usbwifi_hotspot_log\"\n"
         "    mkdir -p \"$ULOG\" 2>/dev/null\n"
-        "    echo \"Installed v2.0.3 at $(date)\" > \"$ULOG/install_ok.txt\" 2>/dev/null\n"
+        "    echo \"Installed v2.0.4 at $(date)\" > \"$ULOG/install_ok.txt\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.log \"$ULOG/\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.txt \"$ULOG/\" 2>/dev/null\n"
         "    for _cf in \"$TMP_DIR/\"*.conf; do\n"
@@ -483,7 +483,7 @@ def build() -> None:
     # 6. Background service daemon (svc/usbwifi-hotspot-daemon.sh)
     daemon_sh = (
         "#!/system/bin/sh\n"
-        "# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.3)\n"
+        "# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.4)\n"
         "export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin\n"
         "export LD_LIBRARY_PATH=/vendor/lib:/system/lib\n"
         "export ANDROID_ROOT=/system\n"
@@ -502,7 +502,8 @@ def build() -> None:
         "WIFI_WORK_DIR=\"/data/misc/wifi/usbwifi_hotspot\"\n"
         "mkdir -p \"$TMP_DIR\" \"$WIFI_WORK_DIR\" \"$WIFI_WORK_DIR/ctrl\" \"$WIFI_WORK_DIR/wpa_ctrl\" /data/dalvik-cache 2>/dev/null\n"
         "chmod 777 /data/local /data/local/tmp \"$TMP_DIR\" \"$WIFI_WORK_DIR\" \"$WIFI_WORK_DIR/ctrl\" \"$WIFI_WORK_DIR/wpa_ctrl\" 2>/dev/null\n"
-        "chown -R 1010:1010 \"$WIFI_WORK_DIR\" 2>/dev/null\n"
+        "# Directories only: hostapd.conf / wpa_supplicant.conf must stay owned by the daemon's own uid\n"
+        "chown 1010:1010 \"$WIFI_WORK_DIR\" \"$WIFI_WORK_DIR/ctrl\" \"$WIFI_WORK_DIR/wpa_ctrl\" 2>/dev/null\n"
         "touch /data/local/tmp/usb_sta.list 2>/dev/null\n"
         "chown 1010:1010 /data/local/tmp/usb_sta.list 2>/dev/null\n"
         "chmod 666 /data/local/tmp/usb_sta.list 2>/dev/null\n"
@@ -659,6 +660,20 @@ def build() -> None:
         "        done\n"
         "    fi\n"
         "    rm -f \"$_pf\" 2>/dev/null\n"
+        "}\n"
+        "\n"
+        "# Make a passphrase-bearing config private (0600, owned by us) WITHOUT ever making it unreadable\n"
+        "# for hostapd/wpa_supplicant: they inherit our credentials, and NEMESIS services may run without\n"
+        "# CAP_DAC_OVERRIDE (v2.0.3 regression: 0660 owned by wifi -> \"Failed to open config file: Permission denied\").\n"
+        "secure_conf_file() {\n"
+        "    local _f=\"$1\"\n"
+        "    [ -f \"$_f\" ] || return 0\n"
+        "    chmod 600 \"$_f\" 2>/dev/null\n"
+        "    if ! cat \"$_f\" >/dev/null 2>&1; then\n"
+        "        chmod 644 \"$_f\" 2>/dev/null\n"
+        "        cat \"$_f\" >/dev/null 2>&1 || chmod 666 \"$_f\" 2>/dev/null\n"
+        "        log_info \"WARN: ${_f##*/} not readable as 0600 by daemon uid -> permissions relaxed\"\n"
+        "    fi\n"
         "}\n"
         "\n"
         "stop_sta_daemons() {\n"
@@ -1017,6 +1032,8 @@ def build() -> None:
         "    if [ ! -f \"$WIFI_WORK_DIR/entropy.bin\" ]; then\n"
         "        dd if=/dev/urandom of=\"$WIFI_WORK_DIR/entropy.bin\" bs=256 count=1 >/dev/null 2>&1\n"
         "    fi\n"
+        "    # Recreate (not overwrite) so the file is owned by our own uid, which hostapd inherits\n"
+        "    rm -f \"$WIFI_WORK_DIR/hostapd.conf\" 2>/dev/null\n"
         "    cat > \"$WIFI_WORK_DIR/hostapd.conf\" <<EOF\n"
         "interface=$_iface\n"
         "driver=nl80211\n"
@@ -1030,14 +1047,13 @@ def build() -> None:
         "rsn_pairwise=CCMP\n"
         "wpa_passphrase=$AP_PASS\n"
         "EOF\n"
-        "    chown -R 1010:1010 \"$WIFI_WORK_DIR\" 2>/dev/null\n"
+        "    chown 1010:1010 \"$WIFI_WORK_DIR\" \"$WIFI_WORK_DIR/ctrl\" \"$WIFI_WORK_DIR/entropy.bin\" 2>/dev/null\n"
         "    chmod 777 \"$WIFI_WORK_DIR\" \"$WIFI_WORK_DIR/ctrl\" \"$TMP_DIR\" 2>/dev/null\n"
-        "    # hostapd.conf holds the AP passphrase: readable by root/wifi only (never world-readable)\n"
-        "    chmod 660 \"$WIFI_WORK_DIR/hostapd.conf\" \"$WIFI_WORK_DIR/entropy.bin\" 2>/dev/null\n"
-        "    chmod 666 /data/local/tmp/usb_sta.list 2>/dev/null\n"
+        "    chmod 666 \"$WIFI_WORK_DIR/entropy.bin\" /data/local/tmp/usb_sta.list 2>/dev/null\n"
+        "    secure_conf_file \"$WIFI_WORK_DIR/hostapd.conf\"\n"
         "    rm -f \"$TMP_DIR/hostapd.conf\" 2>/dev/null\n"
         "    cp \"$WIFI_WORK_DIR/hostapd.conf\" \"$TMP_DIR/hostapd.conf\" 2>/dev/null\n"
-        "    chmod 600 \"$TMP_DIR/hostapd.conf\" 2>/dev/null\n"
+        "    secure_conf_file \"$TMP_DIR/hostapd.conf\"\n"
         "    touch \"$TMP_DIR/hostapd.log\" 2>/dev/null\n"
         "    chmod 666 \"$TMP_DIR/hostapd.log\" 2>/dev/null\n"
         "\n"
@@ -1218,6 +1234,8 @@ def build() -> None:
         "    ip -4 addr flush dev \"$_iface\" >/dev/null 2>&1\n"
         "\n"
         "    mkdir -p \"$WIFI_WORK_DIR\" \"$WIFI_WORK_DIR/wpa_ctrl\" 2>/dev/null\n"
+        "    # Recreate (not overwrite) so the file is owned by our own uid, which wpa_supplicant inherits\n"
+        "    rm -f \"$WIFI_WORK_DIR/wpa_supplicant.conf\" 2>/dev/null\n"
         "    cat > \"$WIFI_WORK_DIR/wpa_supplicant.conf\" <<EOF\n"
         "ctrl_interface=$WIFI_WORK_DIR/wpa_ctrl\n"
         "ap_scan=1\n"
@@ -1263,13 +1281,12 @@ def build() -> None:
         "            done < \"$SAVED_STA_FILE\"\n"
         "        fi\n"
         "    fi\n"
-        "    chown -R 1010:1010 \"$WIFI_WORK_DIR\" 2>/dev/null\n"
+        "    chown 1010:1010 \"$WIFI_WORK_DIR\" \"$WIFI_WORK_DIR/wpa_ctrl\" 2>/dev/null\n"
         "    chmod 777 \"$WIFI_WORK_DIR\" \"$WIFI_WORK_DIR/wpa_ctrl\" 2>/dev/null\n"
-        "    # wpa_supplicant.conf holds STA passwords: readable by root/wifi only (never world-readable)\n"
-        "    chmod 660 \"$WIFI_WORK_DIR/wpa_supplicant.conf\" 2>/dev/null\n"
+        "    secure_conf_file \"$WIFI_WORK_DIR/wpa_supplicant.conf\"\n"
         "    rm -f \"$TMP_DIR/wpa_supplicant.conf\" 2>/dev/null\n"
         "    cp \"$WIFI_WORK_DIR/wpa_supplicant.conf\" \"$TMP_DIR/wpa_supplicant.conf\" 2>/dev/null\n"
-        "    chmod 600 \"$TMP_DIR/wpa_supplicant.conf\" 2>/dev/null\n"
+        "    secure_conf_file \"$TMP_DIR/wpa_supplicant.conf\"\n"
         "    iptables -D INPUT -i \"$_iface\" -j ACCEPT 2>/dev/null\n"
         "    iptables -D OUTPUT -o \"$_iface\" -j ACCEPT 2>/dev/null\n"
         "    iptables -I INPUT 1 -i \"$_iface\" -j ACCEPT 2>/dev/null\n"
@@ -1572,13 +1589,13 @@ def build() -> None:
 
     version_manifest = json.dumps(
         {
-            "version": "2.0.3",
+            "version": "2.0.4",
             "repo": "GRT47/HKG_5W_USB_Wlan",
             "branch": "main",
             "sha256_jar": sha256_jar,
             "sha256_daemon": sha256_daemon,
             "sha256_launch": sha256_launch,
-            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.3: Safe hotspot.conf parsing (SSIDs with spaces/special chars), UTF-8 STA SSIDs, dnsmasq.fifo hang fix, passphrase masking & file permissions, NAT/route cleanup, lower STA polling I/O)",
+            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.4: Fix v2.0.3 regression where hostapd/wpa_supplicant could not read their config (Permission denied), fix garbled STA scan SSIDs/security on 8851bu survey_info)",
         },
         indent=2,
         ensure_ascii=False,
