@@ -1,9 +1,9 @@
 {
-  "version": "2.0.5",
+  "version": "2.0.6",
   "repo": "GRT47/HKG_5W_USB_Wlan",
   "branch": "main",
-  "sha256_jar": "b7e97b8015fe2f32ca31ba64ab211b335c5df0a09eaf55795cf3d218b6c42ca5",
-  "sha256_daemon": "54b5702a8f416430b0c031b9c1ffccfa81c8c082e013bcacc0c4c13af2eeb046",
+  "sha256_jar": "afdf6eb340b1dcf34ed87a5da847cdd212b6b8b3a9350c3d747c8c2d3bc1a343",
+  "sha256_daemon": "b15e99b251ad0f52320672a109c862d449cbca0db30ae6121160983cce8aed44",
   "sha256_launch": "f178706c82d54480db7ed44041ffeaa2e9ea3e958ac1600dc850a4d385c4f9f4",
-  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.5: Fix wpa_supplicant/hostapd config Permission denied (they run as uid wifi): wifi:wifi 0640, 0644 fallback when chown is not permitted, auto-retry if the daemon exits immediately)"
+  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.6: Continuous wpa_supplicant log capture for STA connection diagnostics (head unit logcat buffer is too small), size-capped at 256KB)"
 }

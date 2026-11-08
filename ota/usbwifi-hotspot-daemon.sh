@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.5)
+# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.6)
 export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin
 export LD_LIBRARY_PATH=/vendor/lib:/system/lib
 export ANDROID_ROOT=/system
@@ -194,9 +194,31 @@ prepare_wifi_conf() {
     fi
 }
 
+# Truncate an append-only log once it exceeds $2 bytes (O_APPEND writers simply continue at offset 0)
+# (size = last all-digit field among the 5 after the mode; works for toolbox, busybox and GNU ls -l)
+cap_log_file() {
+    local _f="$1" _max="$2" _sz="" _i=0 _fld
+    [ -f "$_f" ] || return 0
+    set -- $(ls -l "$_f" 2>/dev/null)
+    shift
+    for _fld in "$@"; do
+        _i=$((_i + 1))
+        [ "$_i" -le 5 ] || break
+        case "$_fld" in
+            ''|*[!0-9]*) ;;
+            *) _sz="$_fld" ;;
+        esac
+    done
+    [ -n "$_sz" ] || return 0
+    if [ "$_sz" -gt "$_max" ]; then
+        echo "--- $(date) log truncated at $_sz bytes ---" > "$_f" 2>/dev/null
+    fi
+}
+
 stop_sta_daemons() {
     local _p _fd1 _if
     kill_pid_file "$TMP_DIR/wpa_supplicant.pid"
+    kill_pid_file "$TMP_DIR/wpa_logcat.pid"
     kill_pid_file "$TMP_DIR/dhcpcd.pid"
     for _if in "$ACTIVE_IFACE" rtwlan0 rtwlan1 wlan1; do
         [ -n "$_if" ] || continue
@@ -399,7 +421,6 @@ ACTIVE_IP=""
 ACTIVE_DNS="8.8.8.8"
 STA_NET_KEY=""
 STA_DNS_TICK=0
-STA_LOG_TICK=0
 
 load_single_ko() {
     local _mbase="$1" _plat _target_ko _all_args
@@ -816,6 +837,11 @@ EOF
     iptables -I INPUT 1 -i "$_iface" -j ACCEPT 2>/dev/null
     iptables -I OUTPUT 1 -o "$_iface" -j ACCEPT 2>/dev/null
 
+    # Stream wpa_supplicant's logcat output continuously: the head unit's logcat ring buffer is tiny,
+    # so periodic "logcat -d" dumps lose association / 4-way handshake / disconnect reasons.
+    : > "$TMP_DIR/wpa_supplicant.log" 2>/dev/null
+    logcat -v time -s wpa_supplicant:V >> "$TMP_DIR/wpa_supplicant.log" 2>/dev/null &
+    echo $! > "$TMP_DIR/wpa_logcat.pid"
     /system/bin/wpa_supplicant -Dnl80211 -i"$_iface" -c"$WIFI_WORK_DIR/wpa_supplicant.conf" >>"$TMP_DIR/wpa_supplicant.log" 2>&1 &
     _wpid=$!
     echo "$_wpid" > "$TMP_DIR/wpa_supplicant.pid"
@@ -843,7 +869,6 @@ EOF
         [ -f "$_rproc/ap_info" ] && cat "$_rproc/ap_info" > "$TMP_DIR/sta_ap_info.txt" 2>/dev/null
         [ -f "$_rproc/rx_signal" ] && cat "$_rproc/rx_signal" > "$TMP_DIR/sta_rx_signal.txt" 2>/dev/null
     done
-    logcat -d -v time -s wpa_supplicant:V > "$TMP_DIR/wpa_supplicant.log" 2>/dev/null
     if [ -x /system/bin/wpa_cli ]; then
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" scan_results > "$TMP_DIR/sta_scan.txt" 2>/dev/null
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" status > "$TMP_DIR/wpa_status.txt" 2>/dev/null
@@ -867,12 +892,7 @@ is_sta_healthy() {
         [ -f "$_rproc/ap_info" ] && cat "$_rproc/ap_info" > "$TMP_DIR/sta_ap_info.txt" 2>/dev/null
         [ -f "$_rproc/rx_signal" ] && cat "$_rproc/rx_signal" > "$TMP_DIR/sta_rx_signal.txt" 2>/dev/null
     done
-    # Full logcat dump is expensive (CPU + eMMC writes): refresh the UI's STA log only every ~15s
-    STA_LOG_TICK=$((STA_LOG_TICK + 1))
-    if [ "$STA_LOG_TICK" -ge 3 ]; then
-        STA_LOG_TICK=0
-        logcat -d -v time -s wpa_supplicant:V > "$TMP_DIR/wpa_supplicant.log" 2>/dev/null
-    fi
+    cap_log_file "$TMP_DIR/wpa_supplicant.log" 262144
     if [ -x /system/bin/wpa_cli ]; then
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" status > "$TMP_DIR/wpa_status.txt" 2>/dev/null
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" signal_poll > "$TMP_DIR/wpa_signal.txt" 2>/dev/null

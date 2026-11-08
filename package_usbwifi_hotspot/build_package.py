@@ -372,7 +372,7 @@ def build() -> None:
         "if [ -d /storage/usb0 ]; then\n"
         "    ULOG=\"/storage/usb0/usbwifi_hotspot_log\"\n"
         "    mkdir -p \"$ULOG\" 2>/dev/null\n"
-        "    echo \"Installed v2.0.5 at $(date)\" > \"$ULOG/install_ok.txt\" 2>/dev/null\n"
+        "    echo \"Installed v2.0.6 at $(date)\" > \"$ULOG/install_ok.txt\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.log \"$ULOG/\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.txt \"$ULOG/\" 2>/dev/null\n"
         "    for _cf in \"$TMP_DIR/\"*.conf; do\n"
@@ -483,7 +483,7 @@ def build() -> None:
     # 6. Background service daemon (svc/usbwifi-hotspot-daemon.sh)
     daemon_sh = (
         "#!/system/bin/sh\n"
-        "# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.5)\n"
+        "# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.6)\n"
         "export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin\n"
         "export LD_LIBRARY_PATH=/vendor/lib:/system/lib\n"
         "export ANDROID_ROOT=/system\n"
@@ -678,9 +678,31 @@ def build() -> None:
         "    fi\n"
         "}\n"
         "\n"
+        "# Truncate an append-only log once it exceeds $2 bytes (O_APPEND writers simply continue at offset 0)\n"
+        "# (size = last all-digit field among the 5 after the mode; works for toolbox, busybox and GNU ls -l)\n"
+        "cap_log_file() {\n"
+        "    local _f=\"$1\" _max=\"$2\" _sz=\"\" _i=0 _fld\n"
+        "    [ -f \"$_f\" ] || return 0\n"
+        "    set -- $(ls -l \"$_f\" 2>/dev/null)\n"
+        "    shift\n"
+        "    for _fld in \"$@\"; do\n"
+        "        _i=$((_i + 1))\n"
+        "        [ \"$_i\" -le 5 ] || break\n"
+        "        case \"$_fld\" in\n"
+        "            ''|*[!0-9]*) ;;\n"
+        "            *) _sz=\"$_fld\" ;;\n"
+        "        esac\n"
+        "    done\n"
+        "    [ -n \"$_sz\" ] || return 0\n"
+        "    if [ \"$_sz\" -gt \"$_max\" ]; then\n"
+        "        echo \"--- $(date) log truncated at $_sz bytes ---\" > \"$_f\" 2>/dev/null\n"
+        "    fi\n"
+        "}\n"
+        "\n"
         "stop_sta_daemons() {\n"
         "    local _p _fd1 _if\n"
         "    kill_pid_file \"$TMP_DIR/wpa_supplicant.pid\"\n"
+        "    kill_pid_file \"$TMP_DIR/wpa_logcat.pid\"\n"
         "    kill_pid_file \"$TMP_DIR/dhcpcd.pid\"\n"
         "    for _if in \"$ACTIVE_IFACE\" rtwlan0 rtwlan1 wlan1; do\n"
         "        [ -n \"$_if\" ] || continue\n"
@@ -883,7 +905,6 @@ def build() -> None:
         "ACTIVE_DNS=\"8.8.8.8\"\n"
         "STA_NET_KEY=\"\"\n"
         "STA_DNS_TICK=0\n"
-        "STA_LOG_TICK=0\n"
         "\n"
         "load_single_ko() {\n"
         "    local _mbase=\"$1\" _plat _target_ko _all_args\n"
@@ -1300,6 +1321,11 @@ def build() -> None:
         "    iptables -I INPUT 1 -i \"$_iface\" -j ACCEPT 2>/dev/null\n"
         "    iptables -I OUTPUT 1 -o \"$_iface\" -j ACCEPT 2>/dev/null\n"
         "\n"
+        "    # Stream wpa_supplicant's logcat output continuously: the head unit's logcat ring buffer is tiny,\n"
+        "    # so periodic \"logcat -d\" dumps lose association / 4-way handshake / disconnect reasons.\n"
+        "    : > \"$TMP_DIR/wpa_supplicant.log\" 2>/dev/null\n"
+        "    logcat -v time -s wpa_supplicant:V >> \"$TMP_DIR/wpa_supplicant.log\" 2>/dev/null &\n"
+        "    echo $! > \"$TMP_DIR/wpa_logcat.pid\"\n"
         "    /system/bin/wpa_supplicant -Dnl80211 -i\"$_iface\" -c\"$WIFI_WORK_DIR/wpa_supplicant.conf\" >>\"$TMP_DIR/wpa_supplicant.log\" 2>&1 &\n"
         "    _wpid=$!\n"
         "    echo \"$_wpid\" > \"$TMP_DIR/wpa_supplicant.pid\"\n"
@@ -1327,7 +1353,6 @@ def build() -> None:
         "        [ -f \"$_rproc/ap_info\" ] && cat \"$_rproc/ap_info\" > \"$TMP_DIR/sta_ap_info.txt\" 2>/dev/null\n"
         "        [ -f \"$_rproc/rx_signal\" ] && cat \"$_rproc/rx_signal\" > \"$TMP_DIR/sta_rx_signal.txt\" 2>/dev/null\n"
         "    done\n"
-        "    logcat -d -v time -s wpa_supplicant:V > \"$TMP_DIR/wpa_supplicant.log\" 2>/dev/null\n"
         "    if [ -x /system/bin/wpa_cli ]; then\n"
         "        /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$_iface\" scan_results > \"$TMP_DIR/sta_scan.txt\" 2>/dev/null\n"
         "        /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$_iface\" status > \"$TMP_DIR/wpa_status.txt\" 2>/dev/null\n"
@@ -1351,12 +1376,7 @@ def build() -> None:
         "        [ -f \"$_rproc/ap_info\" ] && cat \"$_rproc/ap_info\" > \"$TMP_DIR/sta_ap_info.txt\" 2>/dev/null\n"
         "        [ -f \"$_rproc/rx_signal\" ] && cat \"$_rproc/rx_signal\" > \"$TMP_DIR/sta_rx_signal.txt\" 2>/dev/null\n"
         "    done\n"
-        "    # Full logcat dump is expensive (CPU + eMMC writes): refresh the UI's STA log only every ~15s\n"
-        "    STA_LOG_TICK=$((STA_LOG_TICK + 1))\n"
-        "    if [ \"$STA_LOG_TICK\" -ge 3 ]; then\n"
-        "        STA_LOG_TICK=0\n"
-        "        logcat -d -v time -s wpa_supplicant:V > \"$TMP_DIR/wpa_supplicant.log\" 2>/dev/null\n"
-        "    fi\n"
+        "    cap_log_file \"$TMP_DIR/wpa_supplicant.log\" 262144\n"
         "    if [ -x /system/bin/wpa_cli ]; then\n"
         "        /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$_iface\" status > \"$TMP_DIR/wpa_status.txt\" 2>/dev/null\n"
         "        /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$_iface\" signal_poll > \"$TMP_DIR/wpa_signal.txt\" 2>/dev/null\n"
@@ -1605,13 +1625,13 @@ def build() -> None:
 
     version_manifest = json.dumps(
         {
-            "version": "2.0.5",
+            "version": "2.0.6",
             "repo": "GRT47/HKG_5W_USB_Wlan",
             "branch": "main",
             "sha256_jar": sha256_jar,
             "sha256_daemon": sha256_daemon,
             "sha256_launch": sha256_launch,
-            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.5: Fix wpa_supplicant/hostapd config Permission denied (they run as uid wifi): wifi:wifi 0640, 0644 fallback when chown is not permitted, auto-retry if the daemon exits immediately)",
+            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.6: Continuous wpa_supplicant log capture for STA connection diagnostics (head unit logcat buffer is too small), size-capped at 256KB)",
         },
         indent=2,
         ensure_ascii=False,
