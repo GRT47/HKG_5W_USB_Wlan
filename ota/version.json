@@ -1,9 +1,9 @@
 {
-  "version": "2.0.4",
+  "version": "2.0.5",
   "repo": "GRT47/HKG_5W_USB_Wlan",
   "branch": "main",
-  "sha256_jar": "3f8cc5018285c53043f95a5f462d85b60a98f24d13bf5f5ce8a119801bf28ff4",
-  "sha256_daemon": "3aa1f67b3c12978239536afd64db7690ba47183e585250c15b5101b11043a7d9",
+  "sha256_jar": "b7e97b8015fe2f32ca31ba64ab211b335c5df0a09eaf55795cf3d218b6c42ca5",
+  "sha256_daemon": "54b5702a8f416430b0c031b9c1ffccfa81c8c082e013bcacc0c4c13af2eeb046",
   "sha256_launch": "f178706c82d54480db7ed44041ffeaa2e9ea3e958ac1600dc850a4d385c4f9f4",
-  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.4: Fix v2.0.3 regression where hostapd/wpa_supplicant could not read their config (Permission denied), fix garbled STA scan SSIDs/security on 8851bu survey_info)"
+  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.5: Fix wpa_supplicant/hostapd config Permission denied (they run as uid wifi): wifi:wifi 0640, 0644 fallback when chown is not permitted, auto-retry if the daemon exits immediately)"
 }

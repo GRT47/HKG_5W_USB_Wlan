@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.4)
+# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.5)
 export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin
 export LD_LIBRARY_PATH=/vendor/lib:/system/lib
 export ANDROID_ROOT=/system
@@ -178,17 +178,19 @@ kill_pid_file() {
     rm -f "$_pf" 2>/dev/null
 }
 
-# Make a passphrase-bearing config private (0600, owned by us) WITHOUT ever making it unreadable
-# for hostapd/wpa_supplicant: they inherit our credentials, and NEMESIS services may run without
-# CAP_DAC_OVERRIDE (v2.0.3 regression: 0660 owned by wifi -> "Failed to open config file: Permission denied").
-secure_conf_file() {
+# hostapd / wpa_supplicant on Android drop to uid/gid wifi (1010) in os_program_init() BEFORE they
+# read their config, so the config must be readable by wifi (v2.0.3/v2.0.4 regression: root-owned
+# 0660/0600 -> "Failed to open config file: Permission denied").
+# Prefer wifi:wifi 0640 (not world-readable). Some units do not allow chown (file stays owned by us):
+# then fall back to 0644, which is what v2.0.2 effectively used (0666).
+prepare_wifi_conf() {
     local _f="$1"
     [ -f "$_f" ] || return 0
-    chmod 600 "$_f" 2>/dev/null
-    if ! cat "$_f" >/dev/null 2>&1; then
+    chown 1010:1010 "$_f" 2>/dev/null
+    if [ -O "$_f" ]; then
         chmod 644 "$_f" 2>/dev/null
-        cat "$_f" >/dev/null 2>&1 || chmod 666 "$_f" 2>/dev/null
-        log_info "WARN: ${_f##*/} not readable as 0600 by daemon uid -> permissions relaxed"
+    else
+        chmod 640 "$_f" 2>/dev/null
     fi
 }
 
@@ -497,7 +499,7 @@ ensure_hostapd_usb_binary() {
 }
 
 start_hotspot_on_iface() {
-    local _iface="$1"
+    local _iface="$1" _hpid
     load_config
     local _ip="$AP_IP"
     local _dstart="$DHCP_START"
@@ -548,7 +550,6 @@ start_hotspot_on_iface() {
     if [ ! -f "$WIFI_WORK_DIR/entropy.bin" ]; then
         dd if=/dev/urandom of="$WIFI_WORK_DIR/entropy.bin" bs=256 count=1 >/dev/null 2>&1
     fi
-    # Recreate (not overwrite) so the file is owned by our own uid, which hostapd inherits
     rm -f "$WIFI_WORK_DIR/hostapd.conf" 2>/dev/null
     cat > "$WIFI_WORK_DIR/hostapd.conf" <<EOF
 interface=$_iface
@@ -566,16 +567,24 @@ EOF
     chown 1010:1010 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/ctrl" "$WIFI_WORK_DIR/entropy.bin" 2>/dev/null
     chmod 777 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/ctrl" "$TMP_DIR" 2>/dev/null
     chmod 666 "$WIFI_WORK_DIR/entropy.bin" /data/local/tmp/usb_sta.list 2>/dev/null
-    secure_conf_file "$WIFI_WORK_DIR/hostapd.conf"
+    prepare_wifi_conf "$WIFI_WORK_DIR/hostapd.conf"
     rm -f "$TMP_DIR/hostapd.conf" 2>/dev/null
     cp "$WIFI_WORK_DIR/hostapd.conf" "$TMP_DIR/hostapd.conf" 2>/dev/null
-    secure_conf_file "$TMP_DIR/hostapd.conf"
+    chmod 600 "$TMP_DIR/hostapd.conf" 2>/dev/null
     touch "$TMP_DIR/hostapd.log" 2>/dev/null
     chmod 666 "$TMP_DIR/hostapd.log" 2>/dev/null
 
     "$TMP_DIR/hostapd_usb" -e "$WIFI_WORK_DIR/entropy.bin" "$WIFI_WORK_DIR/hostapd.conf" >> "$TMP_DIR/hostapd.log" 2>&1 &
-    echo $! > "$TMP_DIR/hostapd.pid"
+    _hpid=$!
+    echo "$_hpid" > "$TMP_DIR/hostapd.pid"
     sleep 2
+    if [ ! -d "/proc/$_hpid" ]; then
+        log_info "WARN: hostapd exited immediately -> retrying with hostapd.conf 0644"
+        chmod 644 "$WIFI_WORK_DIR/hostapd.conf" 2>/dev/null
+        "$TMP_DIR/hostapd_usb" -e "$WIFI_WORK_DIR/entropy.bin" "$WIFI_WORK_DIR/hostapd.conf" >> "$TMP_DIR/hostapd.log" 2>&1 &
+        echo $! > "$TMP_DIR/hostapd.pid"
+        sleep 2
+    fi
 
     # Re-ensure IP address in case hostapd reset interface state on startup
     if ! ip -4 addr show dev "$_iface" 2>/dev/null | grep -q "$_ip/"; then
@@ -730,7 +739,7 @@ EOF
 }
 
 start_sta_on_iface() {
-    local _iface="$1" _prio=100 _s_ssid _s_pass
+    local _iface="$1" _prio=100 _s_ssid _s_pass _wpid
     load_config
     stop_ap_daemons
     stop_sta_daemons
@@ -750,7 +759,6 @@ start_sta_on_iface() {
     ip -4 addr flush dev "$_iface" >/dev/null 2>&1
 
     mkdir -p "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
-    # Recreate (not overwrite) so the file is owned by our own uid, which wpa_supplicant inherits
     rm -f "$WIFI_WORK_DIR/wpa_supplicant.conf" 2>/dev/null
     cat > "$WIFI_WORK_DIR/wpa_supplicant.conf" <<EOF
 ctrl_interface=$WIFI_WORK_DIR/wpa_ctrl
@@ -799,17 +807,25 @@ EOF
     fi
     chown 1010:1010 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
     chmod 777 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
-    secure_conf_file "$WIFI_WORK_DIR/wpa_supplicant.conf"
+    prepare_wifi_conf "$WIFI_WORK_DIR/wpa_supplicant.conf"
     rm -f "$TMP_DIR/wpa_supplicant.conf" 2>/dev/null
     cp "$WIFI_WORK_DIR/wpa_supplicant.conf" "$TMP_DIR/wpa_supplicant.conf" 2>/dev/null
-    secure_conf_file "$TMP_DIR/wpa_supplicant.conf"
+    chmod 600 "$TMP_DIR/wpa_supplicant.conf" 2>/dev/null
     iptables -D INPUT -i "$_iface" -j ACCEPT 2>/dev/null
     iptables -D OUTPUT -o "$_iface" -j ACCEPT 2>/dev/null
     iptables -I INPUT 1 -i "$_iface" -j ACCEPT 2>/dev/null
     iptables -I OUTPUT 1 -o "$_iface" -j ACCEPT 2>/dev/null
 
     /system/bin/wpa_supplicant -Dnl80211 -i"$_iface" -c"$WIFI_WORK_DIR/wpa_supplicant.conf" >>"$TMP_DIR/wpa_supplicant.log" 2>&1 &
-    echo $! > "$TMP_DIR/wpa_supplicant.pid"
+    _wpid=$!
+    echo "$_wpid" > "$TMP_DIR/wpa_supplicant.pid"
+    sleep 2
+    if [ ! -d "/proc/$_wpid" ]; then
+        log_info "WARN: wpa_supplicant exited immediately -> retrying with wpa_supplicant.conf 0644"
+        chmod 644 "$WIFI_WORK_DIR/wpa_supplicant.conf" 2>/dev/null
+        /system/bin/wpa_supplicant -Dnl80211 -i"$_iface" -c"$WIFI_WORK_DIR/wpa_supplicant.conf" >>"$TMP_DIR/wpa_supplicant.log" 2>&1 &
+        echo $! > "$TMP_DIR/wpa_supplicant.pid"
+    fi
     if [ -z "$STA_SSID" ]; then
         sleep 1
         for _rproc in "/proc/net/rtl88x2bu/$_iface" "/proc/net/rtl8851bu/$_iface"; do
