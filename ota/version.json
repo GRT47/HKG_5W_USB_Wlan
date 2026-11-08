@@ -1,9 +1,9 @@
 {
-  "version": "2.0.7",
+  "version": "2.0.8",
   "repo": "GRT47/HKG_5W_USB_Wlan",
   "branch": "main",
-  "sha256_jar": "cc1ad30dc71c99641690cc08653792e47869f672dfbd37eb02e1bda6524f99fb",
-  "sha256_daemon": "1d749254a68ee74c38110616b5915fa074a37bf1d23c1e79c1a461e9330e7091",
+  "sha256_jar": "e3d4e0a291e2a7aee71f25e33c1100c9f405632f4f97aac0ba20dc03189b2bc5",
+  "sha256_daemon": "160b530ab9cc6f134bbb1b20b80aa8257fbcaf4aa6ed55fe264e2f196c1bbc43",
   "sha256_launch": "f178706c82d54480db7ed44041ffeaa2e9ea3e958ac1600dc850a4d385c4f9f4",
-  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.7: Korean channel plan (rtw_country_code=KR + runtime /proc country_code) so STA can use 2.4GHz ch12-13, wpa_supplicant -d diagnostics)"
+  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.8: STA fix - Android wpa_supplicant never scans by itself and there is no wpa_cli: trigger scan/reconnect via SIGHUP; detect association by operstate instead of stale driver ap_info)"
 }

@@ -53,7 +53,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class UsbWifiStatusMain {
 
-    public static final String UI_VERSION = "2.0.7";
+    public static final String UI_VERSION = "2.0.8";
     public static final String GITHUB_RAW_HOST = "raw.githubusercontent.com";
     public static final String GITHUB_OTA_BASE_PATH = "/GRT47/HKG_5W_USB_Wlan/main/ota";
     private static final Charset UTF8 = Charset.forName("UTF-8");
@@ -508,7 +508,11 @@ public class UsbWifiStatusMain {
                 snap.staBand = freq >= 4900 ? "5GHz" : "2.4GHz";
             }
         }
-        if (!snap.staConnected) {
+        // The driver's ap_info keeps showing our own AP ("SSID=HKG_USB_Hotspot") after AP -> STA, so only
+        // trust it once wpa_supplicant has moved the link to operstate "up" (4-way handshake completed).
+        boolean staLinkUp = !snap.usbIface.isEmpty()
+                && "up".equals(readFirstLineQuick(new File("/sys/class/net/" + snap.usbIface + "/operstate")));
+        if (!snap.staConnected && staLinkUp) {
             File[] apInfoFiles = new File[]{
                     !snap.usbIface.isEmpty() ? new File("/proc/net/rtl88x2bu/" + snap.usbIface + "/ap_info") : new File(tmpDir, "sta_ap_info.txt"),
                     !snap.usbIface.isEmpty() ? new File("/proc/net/rtl8851bu/" + snap.usbIface + "/ap_info") : new File(tmpDir, "sta_ap_info.txt"),

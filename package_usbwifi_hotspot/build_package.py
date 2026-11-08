@@ -372,7 +372,7 @@ def build() -> None:
         "if [ -d /storage/usb0 ]; then\n"
         "    ULOG=\"/storage/usb0/usbwifi_hotspot_log\"\n"
         "    mkdir -p \"$ULOG\" 2>/dev/null\n"
-        "    echo \"Installed v2.0.7 at $(date)\" > \"$ULOG/install_ok.txt\" 2>/dev/null\n"
+        "    echo \"Installed v2.0.8 at $(date)\" > \"$ULOG/install_ok.txt\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.log \"$ULOG/\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.txt \"$ULOG/\" 2>/dev/null\n"
         "    for _cf in \"$TMP_DIR/\"*.conf; do\n"
@@ -483,7 +483,7 @@ def build() -> None:
     # 6. Background service daemon (svc/usbwifi-hotspot-daemon.sh)
     daemon_sh = (
         "#!/system/bin/sh\n"
-        "# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.7)\n"
+        "# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.8)\n"
         "export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin\n"
         "export LD_LIBRARY_PATH=/vendor/lib:/system/lib\n"
         "export ANDROID_ROOT=/system\n"
@@ -686,6 +686,43 @@ def build() -> None:
         "        [ -w \"$_rproc/country_code\" ] && echo KR > \"$_rproc/country_code\" 2>/dev/null\n"
         "        [ -r \"$_rproc/country_code\" ] && cat \"$_rproc/country_code\" > \"$TMP_DIR/country_code.txt\" 2>/dev/null\n"
         "    done\n"
+        "}\n"
+        "\n"
+        "# Association = wpa_supplicant moved the link to IF_OPER_UP (it keeps it DORMANT until the 4-way\n"
+        "# handshake completes). Needed because this head unit has no wpa_cli; the driver's ap_info is not\n"
+        "# reliable (it still reports our own AP \"SSID=HKG_USB_Hotspot\" after switching AP -> STA).\n"
+        "sta_link_up() {\n"
+        "    local _os=\"\"\n"
+        "    read -r _os < \"/sys/class/net/$1/operstate\" 2>/dev/null\n"
+        "    [ \"$_os\" = \"up\" ]\n"
+        "}\n"
+        "\n"
+        "# Android's wpa_supplicant never scans on its own at startup (the framework normally sends\n"
+        "# SCAN/RECONNECT over the control socket, and there is no wpa_cli here). SIGHUP makes it reload\n"
+        "# its config, which ends with a scan request when networks are enabled -> scan + associate.\n"
+        "kick_wpa_scan() {\n"
+        "    local _why=\"$1\" _kp=\"\"\n"
+        "    [ \"$STA_NO_HUP\" = \"1\" ] && return 0\n"
+        "    read -r _kp < \"$TMP_DIR/wpa_supplicant.pid\" 2>/dev/null\n"
+        "    [ -n \"$_kp\" ] && [ -d \"/proc/$_kp\" ] || return 0\n"
+        "    log_info \"STA: requesting wpa_supplicant scan/reconnect via SIGHUP ($_why)\"\n"
+        "    kill -HUP \"$_kp\" 2>/dev/null\n"
+        "    sleep 1\n"
+        "    if [ ! -d \"/proc/$_kp\" ]; then\n"
+        "        STA_NO_HUP=1\n"
+        "        log_info \"WARN: wpa_supplicant exited on SIGHUP -> disabling SIGHUP scan trigger\"\n"
+        "    fi\n"
+        "}\n"
+        "\n"
+        "# Keep the wpa_supplicant logcat streamer alive (restart if it died)\n"
+        "ensure_wpa_log_streamer() {\n"
+        "    local _lp=\"\"\n"
+        "    read -r _lp < \"$TMP_DIR/wpa_logcat.pid\" 2>/dev/null\n"
+        "    if [ -z \"$_lp\" ] || [ ! -d \"/proc/$_lp\" ]; then\n"
+        "        echo \"--- $(date) wpa log streamer (re)started ---\" >> \"$TMP_DIR/wpa_supplicant.log\" 2>/dev/null\n"
+        "        logcat -v time -s wpa_supplicant:V >> \"$TMP_DIR/wpa_supplicant.log\" 2>/dev/null &\n"
+        "        echo $! > \"$TMP_DIR/wpa_logcat.pid\"\n"
+        "    fi\n"
         "}\n"
         "\n"
         "# Truncate an append-only log once it exceeds $2 bytes (O_APPEND writers simply continue at offset 0)\n"
@@ -915,6 +952,8 @@ def build() -> None:
         "ACTIVE_DNS=\"8.8.8.8\"\n"
         "STA_NET_KEY=\"\"\n"
         "STA_DNS_TICK=0\n"
+        "STA_KICK_TICK=0\n"
+        "STA_NO_HUP=0\n"
         "\n"
         "load_single_ko() {\n"
         "    local _mbase=\"$1\" _plat _target_ko _all_args\n"
@@ -1355,7 +1394,10 @@ def build() -> None:
         "        chmod 644 \"$WIFI_WORK_DIR/wpa_supplicant.conf\" 2>/dev/null\n"
         "        /system/bin/wpa_supplicant -d -Dnl80211 -i\"$_iface\" -c\"$WIFI_WORK_DIR/wpa_supplicant.conf\" >>\"$TMP_DIR/wpa_supplicant.log\" 2>&1 &\n"
         "        echo $! > \"$TMP_DIR/wpa_supplicant.pid\"\n"
+        "        sleep 2\n"
         "    fi\n"
+        "    STA_KICK_TICK=0\n"
+        "    [ -n \"$STA_SSID\" ] && kick_wpa_scan \"initial connect to $STA_SSID\"\n"
         "    if [ -z \"$STA_SSID\" ]; then\n"
         "        sleep 1\n"
         "        for _rproc in \"/proc/net/rtl88x2bu/$_iface\" \"/proc/net/rtl8851bu/$_iface\"; do\n"
@@ -1397,6 +1439,7 @@ def build() -> None:
         "        [ -f \"$_rproc/rx_signal\" ] && cat \"$_rproc/rx_signal\" > \"$TMP_DIR/sta_rx_signal.txt\" 2>/dev/null\n"
         "    done\n"
         "    cap_log_file \"$TMP_DIR/wpa_supplicant.log\" 262144\n"
+        "    ensure_wpa_log_streamer\n"
         "    if [ -x /system/bin/wpa_cli ]; then\n"
         "        /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$_iface\" status > \"$TMP_DIR/wpa_status.txt\" 2>/dev/null\n"
         "        /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$_iface\" signal_poll > \"$TMP_DIR/wpa_signal.txt\" 2>/dev/null\n"
@@ -1404,8 +1447,18 @@ def build() -> None:
         "    fi\n"
         "    if grep -q \"^wpa_state=COMPLETED\" \"$TMP_DIR/wpa_status.txt\" 2>/dev/null; then\n"
         "        _assoc=1\n"
-        "    elif grep -q \"^SSID=..*\" \"$TMP_DIR/sta_ap_info.txt\" 2>/dev/null; then\n"
+        "    elif sta_link_up \"$_iface\"; then\n"
         "        _assoc=1\n"
+        "    fi\n"
+        "    if [ \"$_assoc\" = \"1\" ]; then\n"
+        "        STA_KICK_TICK=0\n"
+        "    elif [ -n \"$STA_SSID\" ]; then\n"
+        "        # Not associated: re-kick wpa_supplicant every ~30s (it does not retry by itself until a first scan ran)\n"
+        "        STA_KICK_TICK=$((STA_KICK_TICK + 1))\n"
+        "        if [ \"$STA_KICK_TICK\" -ge 6 ]; then\n"
+        "            STA_KICK_TICK=0\n"
+        "            kick_wpa_scan \"still not associated with $STA_SSID\"\n"
+        "        fi\n"
         "    fi\n"
         "    if [ \"$_assoc\" = \"1\" ]; then\n"
         "        if ! ip -4 addr show dev \"$_iface\" 2>/dev/null | grep -q \"inet \"; then\n"
@@ -1538,6 +1591,7 @@ def build() -> None:
         "                [ -w \"$_rproc/survey_info\" ] && echo 1 > \"$_rproc/survey_info\" 2>/dev/null\n"
         "            done\n"
         "            [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p \"$WIFI_WORK_DIR/wpa_ctrl\" -i \"$ACTIVE_IFACE\" scan >/dev/null 2>&1\n"
+        "            sta_link_up \"$ACTIVE_IFACE\" || kick_wpa_scan \"scan requested from dashboard\"\n"
         "            sleep 4\n"
         "            for _rproc in \"/proc/net/rtl88x2bu/$ACTIVE_IFACE\" \"/proc/net/rtl8851bu/$ACTIVE_IFACE\"; do\n"
         "                [ -f \"$_rproc/survey_info\" ] && cat \"$_rproc/survey_info\" > \"$TMP_DIR/sta_survey.txt\" 2>/dev/null\n"
@@ -1645,13 +1699,13 @@ def build() -> None:
 
     version_manifest = json.dumps(
         {
-            "version": "2.0.7",
+            "version": "2.0.8",
             "repo": "GRT47/HKG_5W_USB_Wlan",
             "branch": "main",
             "sha256_jar": sha256_jar,
             "sha256_daemon": sha256_daemon,
             "sha256_launch": sha256_launch,
-            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.7: Korean channel plan (rtw_country_code=KR + runtime /proc country_code) so STA can use 2.4GHz ch12-13, wpa_supplicant -d diagnostics)",
+            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.8: STA fix - Android wpa_supplicant never scans by itself and there is no wpa_cli: trigger scan/reconnect via SIGHUP; detect association by operstate instead of stale driver ap_info)",
         },
         indent=2,
         ensure_ascii=False,

@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.7)
+# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.8)
 export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin
 export LD_LIBRARY_PATH=/vendor/lib:/system/lib
 export ANDROID_ROOT=/system
@@ -202,6 +202,43 @@ apply_country_code() {
         [ -w "$_rproc/country_code" ] && echo KR > "$_rproc/country_code" 2>/dev/null
         [ -r "$_rproc/country_code" ] && cat "$_rproc/country_code" > "$TMP_DIR/country_code.txt" 2>/dev/null
     done
+}
+
+# Association = wpa_supplicant moved the link to IF_OPER_UP (it keeps it DORMANT until the 4-way
+# handshake completes). Needed because this head unit has no wpa_cli; the driver's ap_info is not
+# reliable (it still reports our own AP "SSID=HKG_USB_Hotspot" after switching AP -> STA).
+sta_link_up() {
+    local _os=""
+    read -r _os < "/sys/class/net/$1/operstate" 2>/dev/null
+    [ "$_os" = "up" ]
+}
+
+# Android's wpa_supplicant never scans on its own at startup (the framework normally sends
+# SCAN/RECONNECT over the control socket, and there is no wpa_cli here). SIGHUP makes it reload
+# its config, which ends with a scan request when networks are enabled -> scan + associate.
+kick_wpa_scan() {
+    local _why="$1" _kp=""
+    [ "$STA_NO_HUP" = "1" ] && return 0
+    read -r _kp < "$TMP_DIR/wpa_supplicant.pid" 2>/dev/null
+    [ -n "$_kp" ] && [ -d "/proc/$_kp" ] || return 0
+    log_info "STA: requesting wpa_supplicant scan/reconnect via SIGHUP ($_why)"
+    kill -HUP "$_kp" 2>/dev/null
+    sleep 1
+    if [ ! -d "/proc/$_kp" ]; then
+        STA_NO_HUP=1
+        log_info "WARN: wpa_supplicant exited on SIGHUP -> disabling SIGHUP scan trigger"
+    fi
+}
+
+# Keep the wpa_supplicant logcat streamer alive (restart if it died)
+ensure_wpa_log_streamer() {
+    local _lp=""
+    read -r _lp < "$TMP_DIR/wpa_logcat.pid" 2>/dev/null
+    if [ -z "$_lp" ] || [ ! -d "/proc/$_lp" ]; then
+        echo "--- $(date) wpa log streamer (re)started ---" >> "$TMP_DIR/wpa_supplicant.log" 2>/dev/null
+        logcat -v time -s wpa_supplicant:V >> "$TMP_DIR/wpa_supplicant.log" 2>/dev/null &
+        echo $! > "$TMP_DIR/wpa_logcat.pid"
+    fi
 }
 
 # Truncate an append-only log once it exceeds $2 bytes (O_APPEND writers simply continue at offset 0)
@@ -431,6 +468,8 @@ ACTIVE_IP=""
 ACTIVE_DNS="8.8.8.8"
 STA_NET_KEY=""
 STA_DNS_TICK=0
+STA_KICK_TICK=0
+STA_NO_HUP=0
 
 load_single_ko() {
     local _mbase="$1" _plat _target_ko _all_args
@@ -871,7 +910,10 @@ EOF
         chmod 644 "$WIFI_WORK_DIR/wpa_supplicant.conf" 2>/dev/null
         /system/bin/wpa_supplicant -d -Dnl80211 -i"$_iface" -c"$WIFI_WORK_DIR/wpa_supplicant.conf" >>"$TMP_DIR/wpa_supplicant.log" 2>&1 &
         echo $! > "$TMP_DIR/wpa_supplicant.pid"
+        sleep 2
     fi
+    STA_KICK_TICK=0
+    [ -n "$STA_SSID" ] && kick_wpa_scan "initial connect to $STA_SSID"
     if [ -z "$STA_SSID" ]; then
         sleep 1
         for _rproc in "/proc/net/rtl88x2bu/$_iface" "/proc/net/rtl8851bu/$_iface"; do
@@ -913,6 +955,7 @@ is_sta_healthy() {
         [ -f "$_rproc/rx_signal" ] && cat "$_rproc/rx_signal" > "$TMP_DIR/sta_rx_signal.txt" 2>/dev/null
     done
     cap_log_file "$TMP_DIR/wpa_supplicant.log" 262144
+    ensure_wpa_log_streamer
     if [ -x /system/bin/wpa_cli ]; then
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" status > "$TMP_DIR/wpa_status.txt" 2>/dev/null
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" signal_poll > "$TMP_DIR/wpa_signal.txt" 2>/dev/null
@@ -920,8 +963,18 @@ is_sta_healthy() {
     fi
     if grep -q "^wpa_state=COMPLETED" "$TMP_DIR/wpa_status.txt" 2>/dev/null; then
         _assoc=1
-    elif grep -q "^SSID=..*" "$TMP_DIR/sta_ap_info.txt" 2>/dev/null; then
+    elif sta_link_up "$_iface"; then
         _assoc=1
+    fi
+    if [ "$_assoc" = "1" ]; then
+        STA_KICK_TICK=0
+    elif [ -n "$STA_SSID" ]; then
+        # Not associated: re-kick wpa_supplicant every ~30s (it does not retry by itself until a first scan ran)
+        STA_KICK_TICK=$((STA_KICK_TICK + 1))
+        if [ "$STA_KICK_TICK" -ge 6 ]; then
+            STA_KICK_TICK=0
+            kick_wpa_scan "still not associated with $STA_SSID"
+        fi
     fi
     if [ "$_assoc" = "1" ]; then
         if ! ip -4 addr show dev "$_iface" 2>/dev/null | grep -q "inet "; then
@@ -1054,6 +1107,7 @@ while true; do
                 [ -w "$_rproc/survey_info" ] && echo 1 > "$_rproc/survey_info" 2>/dev/null
             done
             [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$ACTIVE_IFACE" scan >/dev/null 2>&1
+            sta_link_up "$ACTIVE_IFACE" || kick_wpa_scan "scan requested from dashboard"
             sleep 4
             for _rproc in "/proc/net/rtl88x2bu/$ACTIVE_IFACE" "/proc/net/rtl8851bu/$ACTIVE_IFACE"; do
                 [ -f "$_rproc/survey_info" ] && cat "$_rproc/survey_info" > "$TMP_DIR/sta_survey.txt" 2>/dev/null
