@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.1)
+# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.3)
 export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin
 export LD_LIBRARY_PATH=/vendor/lib:/system/lib
 export ANDROID_ROOT=/system
@@ -81,7 +81,33 @@ load_config() {
     DHCP_START="192.168.0.10"
     DHCP_END="192.168.0.100"
     ENABLE_LTE_NAT="1"
-    [ -f "$CONF_FILE" ] && . "$CONF_FILE"
+    parse_kv_file "$CONF_FILE" "USB_VID USB_PID MODULE_NAME MODULE_ARGS WIFI_MODE AP_SSID AP_PASS AP_HW_MODE AP_CHANNEL STA_SSID STA_PASS FORCE_SUBNET AP_IP AP_PREFIX DHCP_START DHCP_END ENABLE_LTE_NAT"
+}
+
+# Safe KEY=VALUE reader: never sources the file (values such as STA_SSID come from
+# nearby access points and may contain spaces, $(...), backticks or ';').
+# Only whitelisted keys are assigned; surrounding "..." or '...' quotes are stripped.
+parse_kv_file() {
+    local _f="$1" _allowed=" $2 " _l _k _v
+    [ -f "$_f" ] || return 0
+    while IFS= read -r _l || [ -n "$_l" ]; do
+        case "$_l" in
+            ''|\#*) continue ;;
+            *=*) ;;
+            *) continue ;;
+        esac
+        _k="${_l%%=*}"
+        _v="${_l#*=}"
+        case "$_allowed" in
+            *" $_k "*) ;;
+            *) continue ;;
+        esac
+        case "$_v" in
+            \"*\") _v="${_v#\"}"; _v="${_v%\"}" ;;
+            \'*\') _v="${_v#\'}"; _v="${_v%\'}" ;;
+        esac
+        eval "$_k=\$_v"
+    done < "$_f"
 }
 load_config
 
@@ -102,13 +128,28 @@ save_active_snapshot() {
     logcat -d -v time 2>/dev/null | grep -iE "(hostapd|dnsmasq|wpa_supplicant|USBWifi|rtwlan|wlan|Softap|Tether|Netd|Dhcp|88x2bu|8851bu)" > "$TMP_DIR/logcat_active.txt" 2>/dev/null
 }
 
+# Copy a hostapd/wpa_supplicant config with passphrases masked (log bundles on USB get shared)
+copy_conf_masked() {
+    local _src="$1" _dst="$2" _l
+    [ -f "$_src" ] || return 0
+    while IFS= read -r _l || [ -n "$_l" ]; do
+        case "$_l" in
+            *wpa_passphrase=*) echo "${_l%%wpa_passphrase=*}wpa_passphrase=********" ;;
+            *psk=*) echo "${_l%%psk=*}psk=********" ;;
+            *) echo "$_l" ;;
+        esac
+    done < "$_src" > "$_dst" 2>/dev/null
+}
+
 sync_logs_to_usb() {
     if [ -d /storage/usb0 ] && [ -w /storage/usb0 ]; then
-        local _ulog="/storage/usb0/usbwifi_hotspot_log"
+        local _ulog="/storage/usb0/usbwifi_hotspot_log" _cf
         mkdir -p "$_ulog" 2>/dev/null
         cp "$TMP_DIR/"*.log "$_ulog/" 2>/dev/null
         cp "$TMP_DIR/"*.txt "$_ulog/" 2>/dev/null
-        cp "$TMP_DIR/"*.conf "$_ulog/" 2>/dev/null
+        for _cf in "$TMP_DIR/"*.conf; do
+            [ -f "$_cf" ] && copy_conf_masked "$_cf" "$_ulog/${_cf##*/}"
+        done
         cp "$TMP_DIR/"*.leases "$_ulog/" 2>/dev/null
         [ -f /data/local/tmp/usb_sta.list ] && cp /data/local/tmp/usb_sta.list "$_ulog/" 2>/dev/null
         ip addr show > "$_ulog/ip_addr.txt" 2>/dev/null
@@ -137,30 +178,12 @@ kill_pid_file() {
 }
 
 stop_sta_daemons() {
-    local _wpid _cpid _w _p _fd1 _if
-    if [ -f "$TMP_DIR/wpa_supplicant.pid" ]; then
-        read -r _wpid < "$TMP_DIR/wpa_supplicant.pid" 2>/dev/null
-        if [ -n "$_wpid" ] && [ -d "/proc/$_wpid" ]; then
-            kill "$_wpid" 2>/dev/null
-            for _w in 1 2 3; do
-                [ -d "/proc/$_wpid" ] || break
-                sleep 1
-            done
-        fi
-        rm -f "$TMP_DIR/wpa_supplicant.pid" 2>/dev/null
-    fi
-    if [ -f "$TMP_DIR/dhcpcd.pid" ]; then
-        read -r _cpid < "$TMP_DIR/dhcpcd.pid" 2>/dev/null
-        [ -n "$_cpid" ] && kill "$_cpid" 2>/dev/null
-        rm -f "$TMP_DIR/dhcpcd.pid" 2>/dev/null
-    fi
+    local _p _fd1 _if
+    kill_pid_file "$TMP_DIR/wpa_supplicant.pid"
+    kill_pid_file "$TMP_DIR/dhcpcd.pid"
     for _if in "$ACTIVE_IFACE" rtwlan0 rtwlan1 wlan1; do
         [ -n "$_if" ] || continue
-        if [ -f "/data/misc/dhcp/dhcpcd-${_if}.pid" ]; then
-            read -r _cpid < "/data/misc/dhcp/dhcpcd-${_if}.pid" 2>/dev/null
-            [ -n "$_cpid" ] && kill "$_cpid" 2>/dev/null
-            rm -f "/data/misc/dhcp/dhcpcd-${_if}.pid" 2>/dev/null
-        fi
+        kill_pid_file "/data/misc/dhcp/dhcpcd-${_if}.pid"
     done
     for _p in /proc/[0-9]*; do
         _p="${_p#/proc/}"
@@ -176,31 +199,38 @@ stop_sta_daemons() {
     ip rule del pref 9790 2>/dev/null
     ip rule del pref 9800 2>/dev/null
     ip route flush table 62 2>/dev/null
+    STA_NET_KEY=""
+}
+
+# Remove NAT / DNAT / routing state recorded by start_hotspot_on_iface (survives daemon re-exec)
+cleanup_ap_rules() {
+    local RULE_IFACE="" RULE_IP="" RULE_PREFIX="" RULE_DNS="" _net
+    if [ -f "$TMP_DIR/ap_rules.state" ]; then
+        parse_kv_file "$TMP_DIR/ap_rules.state" "RULE_IFACE RULE_IP RULE_PREFIX RULE_DNS"
+        if [ -n "$RULE_IFACE" ] && [ -n "$RULE_IP" ]; then
+            _net="${RULE_IP%.*}.0/${RULE_PREFIX:-24}"
+            if [ -n "$RULE_DNS" ]; then
+                iptables -t nat -D PREROUTING -i "$RULE_IFACE" -d "$RULE_IP" -p udp --dport 53 -j DNAT --to-destination "$RULE_DNS:53" 2>/dev/null
+                iptables -t nat -D PREROUTING -i "$RULE_IFACE" -d "$RULE_IP" -p tcp --dport 53 -j DNAT --to-destination "$RULE_DNS:53" 2>/dev/null
+            fi
+            iptables -t nat -D POSTROUTING -s "$_net" -o rmnet+ -j MASQUERADE 2>/dev/null
+            ip route del "$_net" dev "$RULE_IFACE" table 60 2>/dev/null
+            ip route del "$_net" dev "$RULE_IFACE" table 61 2>/dev/null
+        fi
+        rm -f "$TMP_DIR/ap_rules.state" 2>/dev/null
+    fi
+    iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+    ip route del default metric 999 table default 2>/dev/null
+    ip rule del pref 9850 2>/dev/null
+    ip rule del pref 9851 2>/dev/null
+    ip rule del pref 9852 2>/dev/null
 }
 
 stop_ap_daemons() {
-    local _hpid _dpid _spid _w _if _p _fd0 _fd1
-    if [ -f "$TMP_DIR/hostapd.pid" ]; then
-        read -r _hpid < "$TMP_DIR/hostapd.pid" 2>/dev/null
-        if [ -n "$_hpid" ] && [ -d "/proc/$_hpid" ]; then
-            kill "$_hpid" 2>/dev/null
-            for _w in 1 2 3; do
-                [ -d "/proc/$_hpid" ] || break
-                sleep 1
-            done
-        fi
-        rm -f "$TMP_DIR/hostapd.pid" 2>/dev/null
-    fi
-    if [ -f "$TMP_DIR/dnsmasq.pid" ]; then
-        read -r _dpid < "$TMP_DIR/dnsmasq.pid" 2>/dev/null
-        [ -n "$_dpid" ] && kill "$_dpid" 2>/dev/null
-        rm -f "$TMP_DIR/dnsmasq.pid" 2>/dev/null
-    fi
-    if [ -f "$TMP_DIR/dnsmasq_stdin.pid" ]; then
-        read -r _spid < "$TMP_DIR/dnsmasq_stdin.pid" 2>/dev/null
-        [ -n "$_spid" ] && kill "$_spid" 2>/dev/null
-        rm -f "$TMP_DIR/dnsmasq_stdin.pid" 2>/dev/null
-    fi
+    local _if _p _fd0 _fd1
+    kill_pid_file "$TMP_DIR/hostapd.pid"
+    kill_pid_file "$TMP_DIR/dnsmasq.pid"
+    kill_pid_file "$TMP_DIR/dnsmasq_stdin.pid"
     for _p in /proc/[0-9]*; do
         _p="${_p#/proc/}"
         [ "$_p" = "$$" ] && continue
@@ -232,6 +262,7 @@ stop_ap_daemons() {
     ip rule del pref 17950 2>/dev/null
     ip rule del pref 18000 2>/dev/null
     ip rule del pref 18010 2>/dev/null
+    cleanup_ap_rules
 }
 
 on_stop() {
@@ -349,6 +380,9 @@ INSMOD_FAILED=0
 ACTIVE_IFACE=""
 ACTIVE_IP=""
 ACTIVE_DNS="8.8.8.8"
+STA_NET_KEY=""
+STA_DNS_TICK=0
+STA_LOG_TICK=0
 
 load_single_ko() {
     local _mbase="$1" _plat _target_ko _all_args
@@ -470,8 +504,6 @@ start_hotspot_on_iface() {
             _dend="192.168.43.100"
         fi
     fi
-    ACTIVE_IP="$_ip"
-
     if [ "$_ip" = "192.168.0.1" ]; then
         if ip addr show dev eth0 2>/dev/null | grep -q "192.168.0."; then
             ip addr flush dev eth0 >/dev/null 2>&1
@@ -479,8 +511,10 @@ start_hotspot_on_iface() {
         fi
     fi
 
+    # Stop with the PREVIOUS ACTIVE_IP/ACTIVE_DNS so their DNAT rules are removed, then switch
     stop_sta_daemons
     stop_ap_daemons
+    ACTIVE_IP="$_ip"
     ensure_hostapd_usb_binary
 
     log_info "Configuring AP on $_iface with $_ip/$AP_PREFIX ($AP_SSID, mode=$AP_HW_MODE, ch=$AP_CHANNEL)"
@@ -514,8 +548,12 @@ wpa_passphrase=$AP_PASS
 EOF
     chown -R 1010:1010 "$WIFI_WORK_DIR" 2>/dev/null
     chmod 777 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/ctrl" "$TMP_DIR" 2>/dev/null
-    chmod 666 "$WIFI_WORK_DIR/hostapd.conf" "$WIFI_WORK_DIR/entropy.bin" /data/local/tmp/usb_sta.list 2>/dev/null
+    # hostapd.conf holds the AP passphrase: readable by root/wifi only (never world-readable)
+    chmod 660 "$WIFI_WORK_DIR/hostapd.conf" "$WIFI_WORK_DIR/entropy.bin" 2>/dev/null
+    chmod 666 /data/local/tmp/usb_sta.list 2>/dev/null
+    rm -f "$TMP_DIR/hostapd.conf" 2>/dev/null
     cp "$WIFI_WORK_DIR/hostapd.conf" "$TMP_DIR/hostapd.conf" 2>/dev/null
+    chmod 600 "$TMP_DIR/hostapd.conf" 2>/dev/null
     touch "$TMP_DIR/hostapd.log" 2>/dev/null
     chmod 666 "$TMP_DIR/hostapd.log" 2>/dev/null
 
@@ -628,6 +666,13 @@ EOF
             ip route replace default via "$_up_gw" dev "$_up_dev" metric 999 table default >/dev/null 2>&1
         fi
     fi
+    # Record what was installed so cleanup_ap_rules can remove it later (even after OTA re-exec)
+    {
+        echo "RULE_IFACE=$_iface"
+        echo "RULE_IP=$_ip"
+        echo "RULE_PREFIX=$AP_PREFIX"
+        echo "RULE_DNS=$_primary_dns"
+    } > "$TMP_DIR/ap_rules.state" 2>/dev/null
 
     rm -f "$TMP_DIR/dnsmasq.fifo" 2>/dev/null
     mknod "$TMP_DIR/dnsmasq.fifo" p 2>/dev/null || mkfifo "$TMP_DIR/dnsmasq.fifo" 2>/dev/null
@@ -635,7 +680,9 @@ EOF
         echo -n "update_ifaces:$_iface" > "$TMP_DIR/dnsmasq.fifo" 2>/dev/null
         ( while true; do sleep 3600; done ) >> "$TMP_DIR/dnsmasq.fifo" &
     else
-        ( while true; do sleep 3600; done ) > "$TMP_DIR/dnsmasq.fifo" &
+        # The stdin holder itself sends update_ifaces: the daemon never opens the FIFO for writing,
+        # so it cannot block forever if dnsmasq exits early (FIFO open() blocks without a reader).
+        ( echo -n "update_ifaces:$_iface"; while true; do sleep 3600; done ) > "$TMP_DIR/dnsmasq.fifo" &
     fi
     echo $! > "$TMP_DIR/dnsmasq_stdin.pid"
     if [ "$ENABLE_LTE_NAT" = "1" ]; then
@@ -660,7 +707,6 @@ EOF
             --pid-file="$TMP_DIR/dnsmasq.pid" < "$TMP_DIR/dnsmasq.fifo" >>"$TMP_DIR/dnsmasq.log" 2>&1 &
     fi
     sleep 1
-    [ -p "$TMP_DIR/dnsmasq.fifo" ] && echo -n "update_ifaces:$_iface" > "$TMP_DIR/dnsmasq.fifo" 2>/dev/null
 
     log_info "SoftAP active on $_iface ($_ip/$AP_PREFIX, SSID=$AP_SSID, DNS=$_dns_list)"
     save_active_snapshot
@@ -735,8 +781,11 @@ EOF
     fi
     chown -R 1010:1010 "$WIFI_WORK_DIR" 2>/dev/null
     chmod 777 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
-    chmod 666 "$WIFI_WORK_DIR/wpa_supplicant.conf" 2>/dev/null
+    # wpa_supplicant.conf holds STA passwords: readable by root/wifi only (never world-readable)
+    chmod 660 "$WIFI_WORK_DIR/wpa_supplicant.conf" 2>/dev/null
+    rm -f "$TMP_DIR/wpa_supplicant.conf" 2>/dev/null
     cp "$WIFI_WORK_DIR/wpa_supplicant.conf" "$TMP_DIR/wpa_supplicant.conf" 2>/dev/null
+    chmod 600 "$TMP_DIR/wpa_supplicant.conf" 2>/dev/null
     iptables -D INPUT -i "$_iface" -j ACCEPT 2>/dev/null
     iptables -D OUTPUT -o "$_iface" -j ACCEPT 2>/dev/null
     iptables -I INPUT 1 -i "$_iface" -j ACCEPT 2>/dev/null
@@ -785,7 +834,12 @@ is_sta_healthy() {
         [ -f "$_rproc/ap_info" ] && cat "$_rproc/ap_info" > "$TMP_DIR/sta_ap_info.txt" 2>/dev/null
         [ -f "$_rproc/rx_signal" ] && cat "$_rproc/rx_signal" > "$TMP_DIR/sta_rx_signal.txt" 2>/dev/null
     done
-    logcat -d -v time -s wpa_supplicant:V > "$TMP_DIR/wpa_supplicant.log" 2>/dev/null
+    # Full logcat dump is expensive (CPU + eMMC writes): refresh the UI's STA log only every ~15s
+    STA_LOG_TICK=$((STA_LOG_TICK + 1))
+    if [ "$STA_LOG_TICK" -ge 3 ]; then
+        STA_LOG_TICK=0
+        logcat -d -v time -s wpa_supplicant:V > "$TMP_DIR/wpa_supplicant.log" 2>/dev/null
+    fi
     if [ -x /system/bin/wpa_cli ]; then
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" status > "$TMP_DIR/wpa_status.txt" 2>/dev/null
         /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" signal_poll > "$TMP_DIR/wpa_signal.txt" 2>/dev/null
@@ -817,14 +871,27 @@ is_sta_healthy() {
             [ -z "$_gw" ] && _gw="${_sta_ip%.*}.1"
             _dns1="$(getprop dhcp.${_iface}.dns1 2>/dev/null)"
             [ -z "$_dns1" ] && _dns1="8.8.8.8"
-            ip route replace "${_sta_ip%.*}.0/24" dev "$_iface" src "$_sta_ip" table 62 >/dev/null 2>&1
-            ip route replace default via "$_gw" dev "$_iface" table 62 >/dev/null 2>&1
-            ip rule del pref 9790 2>/dev/null
-            ip rule del pref 9800 2>/dev/null
-            ip rule add pref 9790 to "${_sta_ip%.*}.0/24" lookup main 2>/dev/null
-            ip rule add pref 9800 from all lookup 62 2>/dev/null
-            ndc resolver setifdns "$_iface" "" "$_dns1" "8.8.8.8" >/dev/null 2>&1
-            ndc resolver setdefaultif "$_iface" >/dev/null 2>&1
+            # Re-apply routing/DNS only when the lease changed or a rule went missing
+            # (avoids deleting + re-adding the default rule every 5s, which briefly drops traffic)
+            if [ "$STA_NET_KEY" != "$_iface $_sta_ip $_gw $_dns1" ] \
+                || ! ip rule show 2>/dev/null | grep -q "^9800:.*lookup 62" \
+                || ! ip route show table 62 2>/dev/null | grep -q "^default via $_gw "; then
+                ip route replace "${_sta_ip%.*}.0/24" dev "$_iface" src "$_sta_ip" table 62 >/dev/null 2>&1
+                ip route replace default via "$_gw" dev "$_iface" table 62 >/dev/null 2>&1
+                ip rule del pref 9790 2>/dev/null
+                ip rule del pref 9800 2>/dev/null
+                ip rule add pref 9790 to "${_sta_ip%.*}.0/24" lookup main 2>/dev/null
+                ip rule add pref 9800 from all lookup 62 2>/dev/null
+                STA_NET_KEY="$_iface $_sta_ip $_gw $_dns1"
+                STA_DNS_TICK=0
+            fi
+            # DNS can be reset by ConnectivityService (e.g. LTE reconnect): re-assert every ~60s (no traffic gap)
+            if [ "$STA_DNS_TICK" -eq 0 ]; then
+                ndc resolver setifdns "$_iface" "" "$_dns1" "8.8.8.8" >/dev/null 2>&1
+                ndc resolver setdefaultif "$_iface" >/dev/null 2>&1
+            fi
+            STA_DNS_TICK=$((STA_DNS_TICK + 1))
+            [ "$STA_DNS_TICK" -ge 12 ] && STA_DNS_TICK=0
         fi
     fi
     return 0
@@ -940,7 +1007,7 @@ while true; do
                         start_sta_on_iface "$_iface"
                     else
                         SNAP_TICK=$((SNAP_TICK + 1))
-                        if [ "$SNAP_TICK" -ge 2 ]; then
+                        if [ "$SNAP_TICK" -ge 12 ]; then
                             SNAP_TICK=0
                             save_active_snapshot
                         fi
@@ -951,7 +1018,7 @@ while true; do
                         start_hotspot_on_iface "$_iface"
                     else
                         SNAP_TICK=$((SNAP_TICK + 1))
-                        if [ "$SNAP_TICK" -ge 2 ]; then
+                        if [ "$SNAP_TICK" -ge 12 ]; then
                             SNAP_TICK=0
                             save_active_snapshot
                         fi

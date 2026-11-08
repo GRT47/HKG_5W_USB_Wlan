@@ -1,9 +1,9 @@
 {
-  "version": "2.0.2",
+  "version": "2.0.3",
   "repo": "GRT47/HKG_5W_USB_Wlan",
   "branch": "main",
-  "sha256_jar": "45025b7359cee448c423a2119da43da99d039bb5e36cfc9db8876947353403fe",
-  "sha256_daemon": "de2b6cf08c95933a186a6d41225e20ba05e596c18348befd2485ce371e467b71",
+  "sha256_jar": "cf4109c5b10308df75be6408f594be3e2d47d86f5eefa22168a5f5c0a8465597",
+  "sha256_daemon": "524f8d2f341bdc18c47cb92c77e15f7f6deabfd56ef9e8f8a954dbcc4b13ae05",
   "sha256_launch": "f178706c82d54480db7ed44041ffeaa2e9ea3e958ac1600dc850a4d385c4f9f4",
-  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.2: Fix STA disconnect kill_pid_file, dnsmasq.fifo race, STA 5GHz scan & disconnect reconnect, stale boot trigger, 8851bu module params)"
+  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.3: Safe hotspot.conf parsing (SSIDs with spaces/special chars), UTF-8 STA SSIDs, dnsmasq.fifo hang fix, passphrase masking & file permissions, NAT/route cleanup, lower STA polling I/O)"
 }

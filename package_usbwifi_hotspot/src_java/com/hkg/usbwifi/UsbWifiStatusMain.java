@@ -53,7 +53,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class UsbWifiStatusMain {
 
-    public static final String UI_VERSION = "2.0.2";
+    public static final String UI_VERSION = "2.0.3";
     public static final String GITHUB_RAW_HOST = "raw.githubusercontent.com";
     public static final String GITHUB_OTA_BASE_PATH = "/GRT47/HKG_5W_USB_Wlan/main/ota";
     private static final Charset UTF8 = Charset.forName("UTF-8");
@@ -503,7 +503,7 @@ public class UsbWifiStatusMain {
             String wstate = getOrDefault(wstat, "wpa_state", "");
             if ("COMPLETED".equalsIgnoreCase(wstate)) {
                 snap.staConnected = true;
-                snap.staConnectedSsid = getOrDefault(wstat, "ssid", snap.staSsid);
+                snap.staConnectedSsid = decodeWpaSsid(getOrDefault(wstat, "ssid", snap.staSsid));
                 int freq = (int) parseLongSafe(wstat.get("freq"), 2412L);
                 snap.staBand = freq >= 4900 ? "5GHz" : "2.4GHz";
             }
@@ -585,6 +585,7 @@ public class UsbWifiStatusMain {
                     String flags = cols[3];
                     String ssid = cols[4].trim();
                     if (ssid.isEmpty() || ssid.startsWith("\\x00")) continue;
+                    ssid = decodeWpaSsid(ssid);
                     ScanEntry existing = dedup.get(ssid);
                     if (existing == null || rssi > existing.rssi) {
                         ScanEntry se = new ScanEntry();
@@ -2662,6 +2663,11 @@ public class UsbWifiStatusMain {
             if (newSsid.length() < 1 || newSsid.length() > 32 || newPass.length() < 8 || newPass.length() > 63) {
                 return;
             }
+            if (!isSafeConfigValue(newSsid) || !isSafeConfigValue(newPass)) {
+                actionBannerMsg = "⚠️ 이 Wi-Fi 이름에는 저장할 수 없는 제어 문자가 포함되어 있습니다.";
+                postToUi(REFRESH_TASK);
+                return;
+            }
             final boolean isSta = "sta".equals(modalContext);
             isEditModalOpen = false;
             actionBannerMsg = isSta
@@ -3220,7 +3226,13 @@ public class UsbWifiStatusMain {
                 + "  mkdir -p \"$ULOG\" 2>/dev/null; "
                 + "  cp \"$TMP_DIR/\"*.log \"$ULOG/\" 2>/dev/null; "
                 + "  cp \"$TMP_DIR/\"*.txt \"$ULOG/\" 2>/dev/null; "
-                + "  cp \"$TMP_DIR/\"*.conf \"$ULOG/\" 2>/dev/null; "
+                // hostapd.conf / wpa_supplicant.conf: copy with passphrases masked
+                + "  for _cf in \"$TMP_DIR/\"*.conf; do [ -f \"$_cf\" ] || continue; "
+                + "    while IFS= read -r _l || [ -n \"$_l\" ]; do case \"$_l\" in "
+                + "      *wpa_passphrase=*) echo \"${_l%%wpa_passphrase=*}wpa_passphrase=********\" ;; "
+                + "      *psk=*) echo \"${_l%%psk=*}psk=********\" ;; "
+                + "      *) echo \"$_l\" ;; esac; done < \"$_cf\" > \"$ULOG/${_cf##*/}\" 2>/dev/null; "
+                + "  done; "
                 + "  cp \"$TMP_DIR/\"*.leases \"$ULOG/\" 2>/dev/null; "
                 + "  [ -f /data/local/tmp/usb_sta.list ] && cp /data/local/tmp/usb_sta.list \"$ULOG/\" 2>/dev/null; "
                 + "  sync; "
@@ -3384,12 +3396,68 @@ public class UsbWifiStatusMain {
         } finally {
             fos.close();
         }
-        if (target.exists() && !tmp.renameTo(target)) {
-            target.delete();
-            tmp.renameTo(target);
-        } else {
-            tmp.renameTo(target);
+        if (!tmp.renameTo(target)) {
+            // Some filesystems refuse rename-over-existing: delete then retry once
+            if (target.exists() && !target.delete()) {
+                tmp.delete();
+                throw new IOException("Cannot replace " + target.getAbsolutePath());
+            }
+            if (!tmp.renameTo(target)) {
+                tmp.delete();
+                throw new IOException("Cannot write " + target.getAbsolutePath());
+            }
         }
+    }
+
+    /**
+     * Decodes wpa_cli's printf-style SSID escaping (\\, \", \e, \n, \r, \t, \xNN) back to the real
+     * SSID so that UTF-8 (e.g. Korean) names and names with backslashes/quotes match the actual AP.
+     * Returns the input unchanged if it would decode to control characters or invalid UTF-8.
+     */
+    public static String decodeWpaSsid(String s) {
+        if (s == null || s.indexOf('\\') < 0) return s;
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(s.length());
+        byte[] raw = s.getBytes(UTF8);
+        for (int i = 0; i < raw.length; i++) {
+            byte b = raw[i];
+            if (b != '\\' || i + 1 >= raw.length) {
+                bos.write(b);
+                continue;
+            }
+            byte n = raw[++i];
+            if (n == '\\' || n == '"') {
+                bos.write(n);
+            } else if (n == 'x' && i + 2 < raw.length) {
+                int hi = Character.digit((char) raw[i + 1], 16);
+                int lo = Character.digit((char) raw[i + 2], 16);
+                if (hi < 0 || lo < 0) return s;
+                int v = (hi << 4) | lo;
+                if (v < 0x20 || v == 0x7F) return s;
+                bos.write(v);
+                i += 2;
+            } else {
+                return s; // \e \n \r \t or unknown: control chars are not allowed in our config files
+            }
+        }
+        byte[] out = bos.toByteArray();
+        try {
+            java.nio.charset.CharsetDecoder dec = UTF8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
+            return dec.decode(java.nio.ByteBuffer.wrap(out)).toString();
+        } catch (Throwable e) {
+            return s;
+        }
+    }
+
+    /** True if the value can be stored on a single KEY=VALUE line and in wpa_supplicant/hostapd configs. */
+    public static boolean isSafeConfigValue(String s) {
+        if (s == null) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c < 0x20 || c == 0x7F) return false;
+        }
+        return true;
     }
 
     private static String execCommandCapture(String[] cmd, int maxLines) {
@@ -4562,6 +4630,23 @@ public class UsbWifiStatusMain {
         Map<String, String> jmap = parseJsonFlatMap("{\"version\": \"1.9.0\", \"sha256_jar\": \"abcd\"}");
         if (!"1.9.0".equals(jmap.get("version")) || !"abcd".equals(jmap.get("sha256_jar"))) {
             throw new AssertionError("parseJsonFlatMap failed");
+        }
+        // wpa_cli printf-escaped SSIDs -> real SSIDs
+        String korSsid = decodeWpaSsid("\\xed\\x99\\x8d\\xea\\xb8\\xb8\\xeb\\x8f\\x99\\xec\\x9d\\x98 iPhone");
+        if (!"홍길동의 iPhone".equals(korSsid)) {
+            throw new AssertionError("decodeWpaSsid UTF-8 failed: " + korSsid);
+        }
+        if (!"a\\b\"c".equals(decodeWpaSsid("a\\\\b\\\"c"))) {
+            throw new AssertionError("decodeWpaSsid quote/backslash failed");
+        }
+        if (!"bad\\nssid".equals(decodeWpaSsid("bad\\nssid")) || !"x\\x0ay".equals(decodeWpaSsid("x\\x0ay"))) {
+            throw new AssertionError("decodeWpaSsid must not produce control characters");
+        }
+        if (!"Galaxy S23 1A2B".equals(decodeWpaSsid("Galaxy S23 1A2B"))) {
+            throw new AssertionError("decodeWpaSsid plain passthrough failed");
+        }
+        if (isSafeConfigValue("a\nb") || !isSafeConfigValue("Galaxy $(x) `y`; z")) {
+            throw new AssertionError("isSafeConfigValue failed");
         }
 
         // Self-test MapButtonLongPressMonitor (3.0-second MAP button hold detector)
