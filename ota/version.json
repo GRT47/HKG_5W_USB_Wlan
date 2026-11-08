@@ -1,9 +1,9 @@
 {
-  "version": "2.0.6",
+  "version": "2.0.7",
   "repo": "GRT47/HKG_5W_USB_Wlan",
   "branch": "main",
-  "sha256_jar": "afdf6eb340b1dcf34ed87a5da847cdd212b6b8b3a9350c3d747c8c2d3bc1a343",
-  "sha256_daemon": "b15e99b251ad0f52320672a109c862d449cbca0db30ae6121160983cce8aed44",
+  "sha256_jar": "cc1ad30dc71c99641690cc08653792e47869f672dfbd37eb02e1bda6524f99fb",
+  "sha256_daemon": "1d749254a68ee74c38110616b5915fa074a37bf1d23c1e79c1a461e9330e7091",
   "sha256_launch": "f178706c82d54480db7ed44041ffeaa2e9ea3e958ac1600dc850a4d385c4f9f4",
-  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.6: Continuous wpa_supplicant log capture for STA connection diagnostics (head unit logcat buffer is too small), size-capped at 256KB)"
+  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.7: Korean channel plan (rtw_country_code=KR + runtime /proc country_code) so STA can use 2.4GHz ch12-13, wpa_supplicant -d diagnostics)"
 }

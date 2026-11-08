@@ -372,7 +372,7 @@ def build() -> None:
         "if [ -d /storage/usb0 ]; then\n"
         "    ULOG=\"/storage/usb0/usbwifi_hotspot_log\"\n"
         "    mkdir -p \"$ULOG\" 2>/dev/null\n"
-        "    echo \"Installed v2.0.6 at $(date)\" > \"$ULOG/install_ok.txt\" 2>/dev/null\n"
+        "    echo \"Installed v2.0.7 at $(date)\" > \"$ULOG/install_ok.txt\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.log \"$ULOG/\" 2>/dev/null\n"
         "    cp \"$TMP_DIR/\"*.txt \"$ULOG/\" 2>/dev/null\n"
         "    for _cf in \"$TMP_DIR/\"*.conf; do\n"
@@ -483,7 +483,7 @@ def build() -> None:
     # 6. Background service daemon (svc/usbwifi-hotspot-daemon.sh)
     daemon_sh = (
         "#!/system/bin/sh\n"
-        "# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.6)\n"
+        "# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.7)\n"
         "export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin\n"
         "export LD_LIBRARY_PATH=/vendor/lib:/system/lib\n"
         "export ANDROID_ROOT=/system\n"
@@ -676,6 +676,16 @@ def build() -> None:
         "    else\n"
         "        chmod 640 \"$_f\" 2>/dev/null\n"
         "    fi\n"
+        "}\n"
+        "\n"
+        "# Runtime country code (takes effect without reloading the module, e.g. right after an OTA update)\n"
+        "apply_country_code() {\n"
+        "    local _iface=\"$1\" _rproc\n"
+        "    for _rproc in \"/proc/net/rtl88x2bu/$_iface\" \"/proc/net/rtl8851bu/$_iface\"; do\n"
+        "        [ -d \"$_rproc\" ] || continue\n"
+        "        [ -w \"$_rproc/country_code\" ] && echo KR > \"$_rproc/country_code\" 2>/dev/null\n"
+        "        [ -r \"$_rproc/country_code\" ] && cat \"$_rproc/country_code\" > \"$TMP_DIR/country_code.txt\" 2>/dev/null\n"
+        "    done\n"
         "}\n"
         "\n"
         "# Truncate an append-only log once it exceeds $2 bytes (O_APPEND writers simply continue at offset 0)\n"
@@ -933,6 +943,13 @@ def build() -> None:
         "            *) _all_args=\"$_all_args ifname=rtwlan%d if2name=rtwlan%d\" ;;\n"
         "        esac\n"
         "    fi\n"
+        "    # Korean channel plan: without a country code the driver/cfg80211 stay in world mode, where\n"
+        "    # 2.4GHz ch12-13 are passive-only (many Korean APs / phone hotspots use ch13).\n"
+        "    # If the module rejects the parameter, the retry below loads it with default params.\n"
+        "    case \"$_all_args\" in\n"
+        "        *rtw_country_code=*) ;;\n"
+        "        *) _all_args=\"$_all_args rtw_country_code=KR\" ;;\n"
+        "    esac\n"
         "    log_info \"Loading kernel module ${_target_ko##*/} ($_all_args) on $_plat\"\n"
         "    insmod \"$_target_ko\" $_all_args >>\"$TMP_DIR/insmod.log\" 2>&1\n"
         "    if ! grep -q \"^${_mbase} \" /proc/modules 2>/dev/null; then\n"
@@ -1047,6 +1064,7 @@ def build() -> None:
         "        ip link set \"$_iface\" up >/dev/null 2>&1 || return 1\n"
         "    fi\n"
         "    sleep 2\n"
+        "    apply_country_code \"$_iface\"\n"
         "    ip -4 addr flush dev \"$_iface\" >/dev/null 2>&1\n"
         "    ip addr add \"$_ip/$AP_PREFIX\" broadcast \"${_ip%.*}.255\" dev \"$_iface\" >/dev/null 2>&1\n"
         "\n"
@@ -1261,6 +1279,7 @@ def build() -> None:
         "        ip link set \"$_iface\" up >/dev/null 2>&1 || return 1\n"
         "    fi\n"
         "    sleep 1\n"
+        "    apply_country_code \"$_iface\"\n"
         "    ip -4 addr flush dev \"$_iface\" >/dev/null 2>&1\n"
         "\n"
         "    mkdir -p \"$WIFI_WORK_DIR\" \"$WIFI_WORK_DIR/wpa_ctrl\" 2>/dev/null\n"
@@ -1326,14 +1345,15 @@ def build() -> None:
         "    : > \"$TMP_DIR/wpa_supplicant.log\" 2>/dev/null\n"
         "    logcat -v time -s wpa_supplicant:V >> \"$TMP_DIR/wpa_supplicant.log\" 2>/dev/null &\n"
         "    echo $! > \"$TMP_DIR/wpa_logcat.pid\"\n"
-        "    /system/bin/wpa_supplicant -Dnl80211 -i\"$_iface\" -c\"$WIFI_WORK_DIR/wpa_supplicant.conf\" >>\"$TMP_DIR/wpa_supplicant.log\" 2>&1 &\n"
+        "    # -d (diagnostic): logs scan results and why each BSS is skipped (\"skip - ...\") / auth failures\n"
+        "    /system/bin/wpa_supplicant -d -Dnl80211 -i\"$_iface\" -c\"$WIFI_WORK_DIR/wpa_supplicant.conf\" >>\"$TMP_DIR/wpa_supplicant.log\" 2>&1 &\n"
         "    _wpid=$!\n"
         "    echo \"$_wpid\" > \"$TMP_DIR/wpa_supplicant.pid\"\n"
         "    sleep 2\n"
         "    if [ ! -d \"/proc/$_wpid\" ]; then\n"
         "        log_info \"WARN: wpa_supplicant exited immediately -> retrying with wpa_supplicant.conf 0644\"\n"
         "        chmod 644 \"$WIFI_WORK_DIR/wpa_supplicant.conf\" 2>/dev/null\n"
-        "        /system/bin/wpa_supplicant -Dnl80211 -i\"$_iface\" -c\"$WIFI_WORK_DIR/wpa_supplicant.conf\" >>\"$TMP_DIR/wpa_supplicant.log\" 2>&1 &\n"
+        "        /system/bin/wpa_supplicant -d -Dnl80211 -i\"$_iface\" -c\"$WIFI_WORK_DIR/wpa_supplicant.conf\" >>\"$TMP_DIR/wpa_supplicant.log\" 2>&1 &\n"
         "        echo $! > \"$TMP_DIR/wpa_supplicant.pid\"\n"
         "    fi\n"
         "    if [ -z \"$STA_SSID\" ]; then\n"
@@ -1625,13 +1645,13 @@ def build() -> None:
 
     version_manifest = json.dumps(
         {
-            "version": "2.0.6",
+            "version": "2.0.7",
             "repo": "GRT47/HKG_5W_USB_Wlan",
             "branch": "main",
             "sha256_jar": sha256_jar,
             "sha256_daemon": sha256_daemon,
             "sha256_launch": sha256_launch,
-            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.6: Continuous wpa_supplicant log capture for STA connection diagnostics (head unit logcat buffer is too small), size-capped at 256KB)",
+            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.7: Korean channel plan (rtw_country_code=KR + runtime /proc country_code) so STA can use 2.4GHz ch12-13, wpa_supplicant -d diagnostics)",
         },
         indent=2,
         ensure_ascii=False,

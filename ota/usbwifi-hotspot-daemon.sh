@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.6)
+# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.7)
 export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin
 export LD_LIBRARY_PATH=/vendor/lib:/system/lib
 export ANDROID_ROOT=/system
@@ -192,6 +192,16 @@ prepare_wifi_conf() {
     else
         chmod 640 "$_f" 2>/dev/null
     fi
+}
+
+# Runtime country code (takes effect without reloading the module, e.g. right after an OTA update)
+apply_country_code() {
+    local _iface="$1" _rproc
+    for _rproc in "/proc/net/rtl88x2bu/$_iface" "/proc/net/rtl8851bu/$_iface"; do
+        [ -d "$_rproc" ] || continue
+        [ -w "$_rproc/country_code" ] && echo KR > "$_rproc/country_code" 2>/dev/null
+        [ -r "$_rproc/country_code" ] && cat "$_rproc/country_code" > "$TMP_DIR/country_code.txt" 2>/dev/null
+    done
 }
 
 # Truncate an append-only log once it exceeds $2 bytes (O_APPEND writers simply continue at offset 0)
@@ -449,6 +459,13 @@ load_single_ko() {
             *) _all_args="$_all_args ifname=rtwlan%d if2name=rtwlan%d" ;;
         esac
     fi
+    # Korean channel plan: without a country code the driver/cfg80211 stay in world mode, where
+    # 2.4GHz ch12-13 are passive-only (many Korean APs / phone hotspots use ch13).
+    # If the module rejects the parameter, the retry below loads it with default params.
+    case "$_all_args" in
+        *rtw_country_code=*) ;;
+        *) _all_args="$_all_args rtw_country_code=KR" ;;
+    esac
     log_info "Loading kernel module ${_target_ko##*/} ($_all_args) on $_plat"
     insmod "$_target_ko" $_all_args >>"$TMP_DIR/insmod.log" 2>&1
     if ! grep -q "^${_mbase} " /proc/modules 2>/dev/null; then
@@ -563,6 +580,7 @@ start_hotspot_on_iface() {
         ip link set "$_iface" up >/dev/null 2>&1 || return 1
     fi
     sleep 2
+    apply_country_code "$_iface"
     ip -4 addr flush dev "$_iface" >/dev/null 2>&1
     ip addr add "$_ip/$AP_PREFIX" broadcast "${_ip%.*}.255" dev "$_iface" >/dev/null 2>&1
 
@@ -777,6 +795,7 @@ start_sta_on_iface() {
         ip link set "$_iface" up >/dev/null 2>&1 || return 1
     fi
     sleep 1
+    apply_country_code "$_iface"
     ip -4 addr flush dev "$_iface" >/dev/null 2>&1
 
     mkdir -p "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
@@ -842,14 +861,15 @@ EOF
     : > "$TMP_DIR/wpa_supplicant.log" 2>/dev/null
     logcat -v time -s wpa_supplicant:V >> "$TMP_DIR/wpa_supplicant.log" 2>/dev/null &
     echo $! > "$TMP_DIR/wpa_logcat.pid"
-    /system/bin/wpa_supplicant -Dnl80211 -i"$_iface" -c"$WIFI_WORK_DIR/wpa_supplicant.conf" >>"$TMP_DIR/wpa_supplicant.log" 2>&1 &
+    # -d (diagnostic): logs scan results and why each BSS is skipped ("skip - ...") / auth failures
+    /system/bin/wpa_supplicant -d -Dnl80211 -i"$_iface" -c"$WIFI_WORK_DIR/wpa_supplicant.conf" >>"$TMP_DIR/wpa_supplicant.log" 2>&1 &
     _wpid=$!
     echo "$_wpid" > "$TMP_DIR/wpa_supplicant.pid"
     sleep 2
     if [ ! -d "/proc/$_wpid" ]; then
         log_info "WARN: wpa_supplicant exited immediately -> retrying with wpa_supplicant.conf 0644"
         chmod 644 "$WIFI_WORK_DIR/wpa_supplicant.conf" 2>/dev/null
-        /system/bin/wpa_supplicant -Dnl80211 -i"$_iface" -c"$WIFI_WORK_DIR/wpa_supplicant.conf" >>"$TMP_DIR/wpa_supplicant.log" 2>&1 &
+        /system/bin/wpa_supplicant -d -Dnl80211 -i"$_iface" -c"$WIFI_WORK_DIR/wpa_supplicant.conf" >>"$TMP_DIR/wpa_supplicant.log" 2>&1 &
         echo $! > "$TMP_DIR/wpa_supplicant.pid"
     fi
     if [ -z "$STA_SSID" ]; then
