@@ -1,9 +1,9 @@
 {
-  "version": "2.0.8",
+  "version": "2.0.9",
   "repo": "GRT47/HKG_5W_USB_Wlan",
   "branch": "main",
-  "sha256_jar": "e3d4e0a291e2a7aee71f25e33c1100c9f405632f4f97aac0ba20dc03189b2bc5",
-  "sha256_daemon": "160b530ab9cc6f134bbb1b20b80aa8257fbcaf4aa6ed55fe264e2f196c1bbc43",
+  "sha256_jar": "247ec56208cb7f0d34eebaf61584bac3a28da988bb42e83e88ad6f4f3c38713e",
+  "sha256_daemon": "69dd1b65fe9eccffd2763d35ac76e05ce59ac89fb271b196263aec10929b567d",
   "sha256_launch": "f178706c82d54480db7ed44041ffeaa2e9ea3e958ac1600dc850a4d385c4f9f4",
-  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.8: STA fix - Android wpa_supplicant never scans by itself and there is no wpa_cli: trigger scan/reconnect via SIGHUP; detect association by operstate instead of stale driver ap_info)"
+  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.9: Fix RTL8851BU/8831BU 0bda:1a2b CD-ROM stuck on cold boot via BOT StandardEject, CSW read, pre-boot modeswitch & USB authorized recovery)"
 }

@@ -5,6 +5,18 @@ HKG Gen5W USB Wi-Fi Hotspot (AP) & Client (STA) Enabler의 버전별 변경 사�
 
 ---
 
+## v2.0.9 — 2026-11-18
+
+### 수정
+- **RTL8831BU/RTL8851BU 콜드 부팅 시 가상 CD-ROM(`0bda:1a2b`) 전환 멈춤 현상 수정** ([#1](https://github.com/GRT47/HKG_5W_USB_Wlan/issues/1)):
+  - 원인: 콜드 부팅 시 `usb-storage`가 CD-ROM을 마운트한 상태에서 `8851bu.ko`가 Bulk-IN CSW(`USBS`) 응답을 비우지 않고 연속 CBW를 전송해 엔드포인트 STALL이 발생하고, `-ENODEV`를 즉시 반환해 3ms 만에 `usb-storage`가 재바인딩(`scsi host1`)되어 동글이 먹통이 되는 문제가 있었습니다.
+  - 수정:
+    - 커널 드라이버(`8851bu*.ko`) 및 유저스페이스(`UsbWifiStatusMain modeswitch` `usbfs` BOT) 모두 표준 `StandardEject` 규격(`ALLOW MEDIUM REMOVAL` + CSW 수신 → `START STOP UNIT / Eject` + CSW 수신)을 준수하고, 동글이 버스에서 분리될 때까지 최대 800~900ms 대기하여 `usb-storage` 재바인딩을 차단합니다 (OTA 업데이트만으로도 즉시 적용).
+    - 부팅 중 `sys.boot_completed=1` 대기 루프에서도 `0bda:1a2b` 감지 시 선제 전환을 수행하며, 2회 이상 전환 지연 시 `sysfs authorized` `0→1` 토글로 물리 재연결 없이 USB 포트를 자동 복구합니다.
+    - Dalvik `FileChannel.tryLock()`의 `EAGAIN` 예외로 UI 데몬이 중복 실행되던 경고를 정상 종료로 처리했습니다.
+
+---
+
 ## v2.0.8 — 2026-11-08
 
 ### 수정

@@ -3,11 +3,13 @@ package com.hkg.usbwifi;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileDescriptor;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.RandomAccessFile;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
@@ -53,7 +55,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class UsbWifiStatusMain {
 
-    public static final String UI_VERSION = "2.0.8";
+    public static final String UI_VERSION = "2.0.9";
     public static final String GITHUB_RAW_HOST = "raw.githubusercontent.com";
     public static final String GITHUB_OTA_BASE_PATH = "/GRT47/HKG_5W_USB_Wlan/main/ota";
     private static final Charset UTF8 = Charset.forName("UTF-8");
@@ -3615,6 +3617,12 @@ public class UsbWifiStatusMain {
                 return;
             }
         } catch (Throwable lockErr) {
+            String errStr = String.valueOf(lockErr);
+            if (errStr.contains("EAGAIN") || errStr.contains("EACCES")) {
+                System.out.println("[USBWifiUI] Another UsbWifiStatusMain instance holds ui_java.lock; exiting cleanly.");
+                System.exit(0);
+                return;
+            }
             System.out.println("[USBWifiUI] Lock check warning: " + lockErr);
         }
 
@@ -3633,7 +3641,17 @@ public class UsbWifiStatusMain {
         }
         StatusDashboardOverlay.init(installDir);
 
+        File modeswitchFile = new File(tmpDir, "trigger_modeswitch");
+        File modeswitchDoneFile = new File(tmpDir, "modeswitch_done");
         while (true) {
+            if (modeswitchFile.exists()) {
+                modeswitchFile.delete();
+                int msRc = modeswitchRealtekCdrom();
+                try {
+                    writeBytesAtomic(modeswitchDoneFile, (msRc + "\n").getBytes(UTF8));
+                } catch (Throwable ignored) {
+                }
+            }
             if (showUiFile.exists()) {
                 showUiFile.delete();
                 try {
@@ -3646,6 +3664,223 @@ public class UsbWifiStatusMain {
             }
             Thread.sleep(200L);
         }
+    }
+
+    public static int[] parseUsbMassStorageEndpoints(byte[] rawDesc) {
+        if (rawDesc == null) return null;
+        int curIntf = -1;
+        int curClass = -1;
+        int mscIntf = -1;
+        int mscOut = -1;
+        int mscIn = -1;
+        int anyIntf = -1;
+        int anyOut = -1;
+        int anyIn = -1;
+        int pos = 0;
+        while (pos + 2 <= rawDesc.length) {
+            int len = rawDesc[pos] & 0xFF;
+            if (len < 2 || pos + len > rawDesc.length) break;
+            int type = rawDesc[pos + 1] & 0xFF;
+            if (type == 4 && len >= 9) {
+                curIntf = rawDesc[pos + 2] & 0xFF;
+                curClass = rawDesc[pos + 5] & 0xFF;
+            } else if (type == 5 && len >= 7 && curIntf >= 0) {
+                int epAddr = rawDesc[pos + 2] & 0xFF;
+                int attr = rawDesc[pos + 3] & 0xFF;
+                if ((attr & 0x03) == 2) {
+                    boolean isIn = (epAddr & 0x80) != 0;
+                    if (curClass == 0x08) {
+                        if (mscIntf < 0 || mscIntf == curIntf) {
+                            mscIntf = curIntf;
+                            if (!isIn && mscOut < 0) mscOut = epAddr;
+                            if (isIn && mscIn < 0) mscIn = epAddr;
+                        }
+                    } else if (anyIntf < 0 || anyIntf == curIntf) {
+                        anyIntf = curIntf;
+                        if (!isIn && anyOut < 0) anyOut = epAddr;
+                        if (isIn && anyIn < 0) anyIn = epAddr;
+                    }
+                }
+            }
+            pos += len;
+        }
+        if (mscIntf >= 0 && mscOut >= 0) {
+            return new int[]{mscIntf, mscOut, mscIn};
+        }
+        if (anyIntf >= 0 && anyOut >= 0) {
+            return new int[]{anyIntf, anyOut, anyIn};
+        }
+        return null;
+    }
+
+    public static byte[] buildScsiCbw(int tag, byte[] cdb) {
+        byte[] cbw = new byte[31];
+        cbw[0] = (byte) 0x55;
+        cbw[1] = (byte) 0x53;
+        cbw[2] = (byte) 0x42;
+        cbw[3] = (byte) 0x43;
+        cbw[4] = (byte) (tag & 0xFF);
+        cbw[5] = (byte) ((tag >>> 8) & 0xFF);
+        cbw[6] = (byte) ((tag >>> 16) & 0xFF);
+        cbw[7] = (byte) ((tag >>> 24) & 0xFF);
+        int cdbLen = (cdb != null) ? Math.min(cdb.length, 16) : 0;
+        cbw[14] = (byte) cdbLen;
+        if (cdb != null && cdbLen > 0) {
+            System.arraycopy(cdb, 0, cbw, 15, cdbLen);
+        }
+        return cbw;
+    }
+
+    private static int invokeNativeBulkRequest(Object conn, Method bulkMethod, int ep, byte[] buf, int len, int timeoutMs) throws Exception {
+        if (bulkMethod == null) return -1;
+        Class<?>[] pt = bulkMethod.getParameterTypes();
+        Object res = (pt.length == 5)
+                ? bulkMethod.invoke(conn, ep, buf, 0, len, timeoutMs)
+                : bulkMethod.invoke(conn, ep, buf, len, timeoutMs);
+        return (res instanceof Number) ? ((Number) res).intValue() : -1;
+    }
+
+    public static int modeswitchRealtekCdrom() {
+        File usbDir = new File("/sys/bus/usb/devices");
+        File[] entries = usbDir.listFiles();
+        if (entries == null) return 0;
+
+        int overallRc = 0;
+        for (File devDir : entries) {
+            if (!devDir.isDirectory()) continue;
+            String vid = readFirstLineQuick(new File(devDir, "idVendor")).trim().toLowerCase(Locale.US);
+            String pid = readFirstLineQuick(new File(devDir, "idProduct")).trim().toLowerCase(Locale.US);
+            if (!"0bda".equals(vid) || !"1a2b".equals(pid)) continue;
+
+            String busStr = readFirstLineQuick(new File(devDir, "busnum")).trim();
+            String devStr = readFirstLineQuick(new File(devDir, "devnum")).trim();
+            int busNum;
+            int devNum;
+            try {
+                busNum = Integer.parseInt(busStr);
+                devNum = Integer.parseInt(devStr);
+            } catch (Throwable t) {
+                overallRc = 1;
+                continue;
+            }
+
+            String devPath = String.format(Locale.US, "/dev/bus/usb/%03d/%03d", busNum, devNum);
+            RandomAccessFile raf = null;
+            Object conn = null;
+            Method mClose = null;
+            Method mRelease = null;
+            int intfId = 0;
+            boolean opened = false;
+            boolean claimed = false;
+            boolean switched = false;
+            try {
+                raf = new RandomAccessFile(devPath, "rw");
+                Class<?> connCls = Class.forName("android.hardware.usb.UsbDeviceConnection");
+                Class<?> usbDevCls = Class.forName("android.hardware.usb.UsbDevice");
+                Constructor<?> ctor = connCls.getDeclaredConstructor(usbDevCls);
+                ctor.setAccessible(true);
+                conn = ctor.newInstance(new Object[]{null});
+
+                Method mOpen = connCls.getDeclaredMethod("native_open", String.class, FileDescriptor.class);
+                mOpen.setAccessible(true);
+                mClose = connCls.getDeclaredMethod("native_close");
+                mClose.setAccessible(true);
+                Method mDesc = connCls.getDeclaredMethod("native_get_desc");
+                mDesc.setAccessible(true);
+                Method mClaim = connCls.getDeclaredMethod("native_claim_interface", int.class, boolean.class);
+                mClaim.setAccessible(true);
+                mRelease = connCls.getDeclaredMethod("native_release_interface", int.class);
+                mRelease.setAccessible(true);
+                Method mBulk = null;
+                for (Method m : connCls.getDeclaredMethods()) {
+                    if ("native_bulk_request".equals(m.getName())) {
+                        m.setAccessible(true);
+                        mBulk = m;
+                        break;
+                    }
+                }
+
+                if (!Boolean.TRUE.equals(mOpen.invoke(conn, devPath, raf.getFD()))) {
+                    System.out.println("[USBModeswitch] native_open failed on " + devPath);
+                    overallRc = 1;
+                    continue;
+                }
+                opened = true;
+
+                byte[] rawDesc = (byte[]) mDesc.invoke(conn);
+                int[] eps = parseUsbMassStorageEndpoints(rawDesc);
+                intfId = (eps != null) ? eps[0] : 0;
+                int epOut = (eps != null) ? eps[1] : 0x02;
+                int epIn = (eps != null) ? eps[2] : 0x81;
+
+                claimed = Boolean.TRUE.equals(mClaim.invoke(conn, intfId, true));
+                if (!claimed) {
+                    System.out.println("[USBModeswitch] claimInterface(" + intfId + ") failed on " + devPath);
+                    overallRc = 1;
+                    continue;
+                }
+
+                byte[] csw = new byte[13];
+                int r1 = invokeNativeBulkRequest(conn, mBulk, epOut,
+                        buildScsiCbw(1, new byte[]{0x1e, 0x00, 0x00, 0x00, 0x00, 0x00}), 31, 1000);
+                if (epIn != -1) {
+                    invokeNativeBulkRequest(conn, mBulk, epIn, csw, 13, 1000);
+                }
+                int r2 = invokeNativeBulkRequest(conn, mBulk, epOut,
+                        buildScsiCbw(2, new byte[]{0x1b, 0x00, 0x00, 0x00, 0x02, 0x00}), 31, 1000);
+                if (epIn != -1) {
+                    invokeNativeBulkRequest(conn, mBulk, epIn, csw, 13, 1000);
+                }
+
+                for (int w = 0; w < 9; w++) {
+                    String curPid = readFirstLineQuick(new File(devDir, "idProduct")).trim().toLowerCase(Locale.US);
+                    if (!devDir.exists() || !"1a2b".equals(curPid)) {
+                        switched = true;
+                        break;
+                    }
+                    Thread.sleep(100L);
+                }
+
+                int r3 = -1;
+                if (!switched) {
+                    r3 = invokeNativeBulkRequest(conn, mBulk, epOut,
+                            buildScsiCbw(3, new byte[]{(byte) 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00}), 31, 1000);
+                    if (epIn != -1) {
+                        invokeNativeBulkRequest(conn, mBulk, epIn, csw, 13, 1000);
+                    }
+                    for (int w = 0; w < 7; w++) {
+                        String curPid = readFirstLineQuick(new File(devDir, "idProduct")).trim().toLowerCase(Locale.US);
+                        if (!devDir.exists() || !"1a2b".equals(curPid)) {
+                            switched = true;
+                            break;
+                        }
+                        Thread.sleep(100L);
+                    }
+                }
+
+                System.out.println("[USBModeswitch] " + devPath + " intf=" + intfId
+                        + " epOut=0x" + Integer.toHexString(epOut)
+                        + " epIn=" + (epIn == -1 ? "-1" : ("0x" + Integer.toHexString(epIn)))
+                        + " r1=" + r1 + " r2=" + r2 + " r3=" + r3 + " switched=" + switched);
+                if (!switched && r2 < 31 && r3 < 31) {
+                    overallRc = 1;
+                }
+            } catch (Throwable t) {
+                System.out.println("[USBModeswitch] Error on " + devPath + ": " + t);
+                if (!switched) overallRc = 1;
+            } finally {
+                if (claimed && conn != null && mRelease != null) {
+                    try { mRelease.invoke(conn, intfId); } catch (Throwable ignored) {}
+                }
+                if (opened && conn != null && mClose != null) {
+                    try { mClose.invoke(conn); } catch (Throwable ignored) {}
+                }
+                if (raf != null) {
+                    try { raf.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }
+        return overallRc;
     }
 
     public static byte[] patchHostapdBytes(byte[] raw) {
@@ -4819,7 +5054,29 @@ public class UsbWifiStatusMain {
             throw new AssertionError("RTL8812BU (0bda:b812) classification failed");
         }
 
-        System.out.println("USBWIFI STATUS UI SELF-TEST PASSED! (" + compact + ", mapHoldTests=OK, rtl8831buTests=OK)");
+        // 6) USB Mass Storage BOT StandardEject descriptor & CBW tests
+        byte[] syntheticDesc = new byte[]{
+                // Config desc (9 bytes)
+                9, 2, 32, 0, 1, 1, 0, (byte) 0x80, (byte) 250,
+                // Interface 0: Mass Storage (class 0x08), 2 endpoints
+                9, 4, 0, 0, 2, 0x08, 0x06, 0x50, 0,
+                // Endpoint Bulk-OUT 0x02
+                7, 5, 0x02, 0x02, 0x00, 0x02, 0,
+                // Endpoint Bulk-IN 0x81
+                7, 5, (byte) 0x81, 0x02, 0x00, 0x02, 0
+        };
+        int[] parsedEps = parseUsbMassStorageEndpoints(syntheticDesc);
+        if (parsedEps == null || parsedEps[0] != 0 || parsedEps[1] != 0x02 || parsedEps[2] != 0x81) {
+            throw new AssertionError("parseUsbMassStorageEndpoints failed");
+        }
+        byte[] cbwEject = buildScsiCbw(2, new byte[]{0x1b, 0x00, 0x00, 0x00, 0x02, 0x00});
+        if (cbwEject.length != 31 || cbwEject[0] != 0x55 || cbwEject[1] != 0x53 || cbwEject[2] != 0x42
+                || cbwEject[3] != 0x43 || cbwEject[4] != 0x02 || cbwEject[14] != 0x06
+                || cbwEject[15] != 0x1b || cbwEject[19] != 0x02) {
+            throw new AssertionError("buildScsiCbw failed");
+        }
+
+        System.out.println("USBWIFI STATUS UI SELF-TEST PASSED! (" + compact + ", mapHoldTests=OK, rtl8831buTests=OK, modeswitchTests=OK)");
         return 0;
     }
 
@@ -4832,12 +5089,14 @@ public class UsbWifiStatusMain {
             File tmpDir = new File(TMP_DIR_PATH);
             if (!tmpDir.exists()) tmpDir.mkdirs();
             writeBytesAtomic(new File(tmpDir, "show_ui"), "1".getBytes(UTF8));
+        } else if ("modeswitch".equals(args[0])) {
+            System.exit(modeswitchRealtekCdrom());
         } else if ("patch-hostapd".equals(args[0]) && args.length >= 3) {
             patchHostapdBinary(new File(args[1]), new File(args[2]));
         } else if ("test-self".equals(args[0])) {
             System.exit(runSelfTest());
         } else {
-            System.err.println("Usage: UsbWifiStatusMain [daemon|show-ui|patch-hostapd|test-self]");
+            System.err.println("Usage: UsbWifiStatusMain [daemon|show-ui|modeswitch|patch-hostapd|test-self]");
             System.exit(2);
         }
     }

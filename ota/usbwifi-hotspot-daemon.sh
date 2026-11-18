@@ -62,7 +62,7 @@ done
 exec >>"$TMP_DIR/daemon_stdout.log" 2>&1
 echo "$$" > "$TMP_DIR/daemon.pid" 2>/dev/null
 # Clear any stale one-shot trigger files left over across reboots
-rm -f "$TMP_DIR/force_restart" "$TMP_DIR/ota_reload_daemon" "$TMP_DIR/trigger_scan" "$TMP_DIR/disconnect_sta" 2>/dev/null
+rm -f "$TMP_DIR/force_restart" "$TMP_DIR/ota_reload_daemon" "$TMP_DIR/trigger_scan" "$TMP_DIR/disconnect_sta" "$TMP_DIR/trigger_modeswitch" "$TMP_DIR/modeswitch_done" 2>/dev/null
 
 load_config() {
     USB_VID="0bda"
@@ -393,23 +393,74 @@ is_usb_dongle_present() {
 }
 
 trigger_usb_modeswitch() {
-    local _d _v _p _if_dir _if_id
+    local _d _v _p _if_dir _if_id _p_now _upid _ufd _ui_up _mw _bw
     for _d in /sys/bus/usb/devices/*; do
         if [ -f "$_d/idVendor" ] && [ -f "$_d/idProduct" ]; then
             read -r _v < "$_d/idVendor" 2>/dev/null
             read -r _p < "$_d/idProduct" 2>/dev/null
             if [ "$_v" = "0bda" ] && [ "$_p" = "1a2b" ]; then
-                log_info "Detected Realtek 0bda:1a2b Virtual CD-ROM at ${_d##*/} -> triggering USB modeswitch"
+                MODESWITCH_TRIES=$((MODESWITCH_TRIES + 1))
+                log_info "Detected Realtek 0bda:1a2b Virtual CD-ROM at ${_d##*/} (attempt #$MODESWITCH_TRIES) -> triggering USB modeswitch"
+                # Step A: Userspace usbfs BOT StandardEject (works for both OTA and fresh installs)
+                _ui_up=0
+                if [ -f "$TMP_DIR/ui_java.pid" ]; then
+                    read -r _upid < "$TMP_DIR/ui_java.pid" 2>/dev/null
+                    if [ -n "$_upid" ] && [ -d "/proc/$_upid" ] && kill -0 "$_upid" 2>/dev/null; then
+                        _ufd="$(readlink "/proc/$_upid/fd/1" 2>/dev/null)"
+                        case "$_ufd" in
+                            *usbwifi_hotspot/ui.log*) _ui_up=1 ;;
+                        esac
+                    fi
+                fi
+                if [ "$_ui_up" = "1" ]; then
+                    rm -f "$TMP_DIR/modeswitch_done" 2>/dev/null
+                    echo "1" > "$TMP_DIR/trigger_modeswitch" 2>/dev/null
+                    for _mw in 1 2 3; do
+                        [ -f "$TMP_DIR/modeswitch_done" ] && break
+                        sleep 1
+                    done
+                else
+                    CLASSPATH="$APP_DIR/bin/usbwifistatus.jar" /system/bin/app_process /system/bin com.hkg.usbwifi.UsbWifiStatusMain modeswitch >>"$TMP_DIR/daemon_stdout.log" 2>&1
+                fi
+                # Step B: Check if already switched away from 1a2b
+                [ -f "$_d/idProduct" ] || continue
+                read -r _p_now < "$_d/idProduct" 2>/dev/null
+                [ "$_p_now" != "1a2b" ] && continue
+                # Step C: Kernel rtl8851bu fallback with non-blocking 3s wait
                 for _if_dir in "$_d/"*:*; do
                     [ -d "$_if_dir" ] || continue
                     _if_id="${_if_dir##*/}"
-                    if [ -e "/sys/bus/usb/drivers/usb-storage/$_if_id" ]; then
-                        echo "$_if_id" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null
-                    fi
-                    if [ -d /sys/bus/usb/drivers/rtl8851bu ]; then
-                        echo "$_if_id" > /sys/bus/usb/drivers/rtl8851bu/bind 2>/dev/null
-                    fi
+                    (
+                        if [ -e "/sys/bus/usb/drivers/usb-storage/$_if_id" ]; then
+                            echo "$_if_id" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null
+                        fi
+                        if [ -d /sys/bus/usb/drivers/rtl8851bu ]; then
+                            echo "$_if_id" > /sys/bus/usb/drivers/rtl8851bu/bind 2>/dev/null
+                        fi
+                    ) &
+                    _mw=$!
+                    for _bw in 1 2 3; do
+                        kill -0 "$_mw" 2>/dev/null || break
+                        sleep 1
+                    done
                 done
+                # Step D: Wedged USB recovery on repeated attempts via sysfs authorized toggle
+                if [ "$MODESWITCH_TRIES" -ge 2 ] && [ -f "$_d/idProduct" ]; then
+                    read -r _p_now < "$_d/idProduct" 2>/dev/null
+                    if [ "$_p_now" = "1a2b" ] && [ -w "$_d/authorized" ]; then
+                        log_info "Resetting stuck 0bda:1a2b at ${_d##*/} via sysfs authorized toggle"
+                        (
+                            echo 0 > "$_d/authorized" 2>/dev/null
+                            sleep 1
+                            echo 1 > "$_d/authorized" 2>/dev/null
+                        ) &
+                        _mw=$!
+                        for _bw in 1 2 3; do
+                            kill -0 "$_mw" 2>/dev/null || break
+                            sleep 1
+                        done
+                    fi
+                fi
             fi
         fi
     done
@@ -463,6 +514,7 @@ find_usb_wifi_iface() {
 }
 
 INSMOD_FAILED=0
+MODESWITCH_TRIES=0
 ACTIVE_IFACE=""
 ACTIVE_IP=""
 ACTIVE_DNS="8.8.8.8"
@@ -529,6 +581,9 @@ ensure_driver_loaded() {
         if grep -q "^88x2bu " /proc/modules 2>/dev/null && { [ ! -f "$MOD_DIR/8851bu.ko" ] || grep -q "^8851bu " /proc/modules 2>/dev/null; }; then
             _ok=1
         fi
+    fi
+    if [ "$_fam" != "cdrom_8851bu" ]; then
+        MODESWITCH_TRIES=0
     fi
     if [ "$_ok" -eq 1 ] && [ "$_fam" != "cdrom_8851bu" ]; then
         INSMOD_FAILED=0
@@ -1075,7 +1130,10 @@ log_info "Service started (pid=$$), monitoring USB Wi-Fi (88x2bu + 8851bu/8831bu
 ensure_driver_loaded
 
 while [ "$(getprop sys.boot_completed)" != "1" ]; do
-    sleep 2 &
+    if [ "$(detect_usb_dongle_family 2>/dev/null)" = "cdrom_8851bu" ]; then
+        trigger_usb_modeswitch
+    fi
+    sleep 1 &
     wait $!
 done
 

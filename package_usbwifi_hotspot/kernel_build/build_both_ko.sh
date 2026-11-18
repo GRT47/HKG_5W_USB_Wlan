@@ -880,33 +880,80 @@ target_probe = """\tRTW_INFO("+%s\\n", __func__);
 
 replacement_probe = """\tRTW_INFO("+%s\\n", __func__);
 
-\t/* Auto-modeswitch Realtek Virtual CD-ROM (0bda:1a2b) into Wi-Fi mode (0bda:b831 / 0bda:b851) */
+\t/* Auto-modeswitch Realtek Virtual CD-ROM (0bda:1a2b) into Wi-Fi mode (0bda:b831 / 0bda:b851 / 3625:010b) */
 \tif (pdid && pdid->idVendor == 0x0bda && pdid->idProduct == 0x1a2b) {
 \t\tstruct usb_device *udev = interface_to_usbdev(pusb_intf);
 \t\tstruct usb_host_interface *iface_desc = pusb_intf ? pusb_intf->cur_altsetting : NULL;
-\t\tint i, ep_out = -1, actual_len = 0;
-\t\tu8 *cbw;
+\t\tint i, w, ep_out = -1, ep_in = -1, actual_len = 0;
+\t\tu8 *cbw, *csw;
+\t\tif (udev)
+\t\t\tudev->dev.devt |= 0x00080000U;
 \t\tif (udev && iface_desc) {
 \t\t\tfor (i = 0; i < iface_desc->desc.bNumEndpoints; i++) {
 \t\t\t\tstruct usb_endpoint_descriptor *ep = &iface_desc->endpoint[i].desc;
-\t\t\t\tif (usb_endpoint_is_bulk_out(ep)) {
+\t\t\t\tif (usb_endpoint_is_bulk_out(ep) && ep_out == -1)
 \t\t\t\t\tep_out = ep->bEndpointAddress;
-\t\t\t\t\tbreak;
-\t\t\t\t}
+\t\t\t\telse if (usb_endpoint_is_bulk_in(ep) && ep_in == -1)
+\t\t\t\t\tep_in = ep->bEndpointAddress;
 \t\t\t}
 \t\t\tif (ep_out != -1) {
-\t\t\t\tcbw = kzalloc(31, GFP_KERNEL);
-\t\t\t\tif (cbw) {
+\t\t\t\tcbw = kzalloc(32, GFP_KERNEL);
+\t\t\t\tcsw = kzalloc(16, GFP_KERNEL);
+\t\t\t\tif (cbw && csw) {
+\t\t\t\t\tusb_clear_halt(udev, usb_sndbulkpipe(udev, ep_out));
+\t\t\t\t\tif (ep_in != -1)
+\t\t\t\t\t\tusb_clear_halt(udev, usb_rcvbulkpipe(udev, ep_in));
+\t\t\t\t\t/* 1) SCSI PREVENT ALLOW MEDIUM REMOVAL (1e 00 00 00 00 00) + read CSW */
+\t\t\t\t\tmemset(cbw, 0, 31);
 \t\t\t\t\tcbw[0] = 0x55; cbw[1] = 0x53; cbw[2] = 0x42; cbw[3] = 0x43;
-\t\t\t\t\tcbw[4] = 0x01; cbw[14] = 0x06; cbw[15] = 0x1b; cbw[19] = 0x02;
+\t\t\t\t\tcbw[4] = 0x01; cbw[14] = 0x06; cbw[15] = 0x1e;
 \t\t\t\t\tusb_bulk_msg(udev, usb_sndbulkpipe(udev, ep_out), cbw, 31, &actual_len, 1000);
-\t\t\t\t\tcbw[4] = 0x02; cbw[14] = 0x06; cbw[15] = 0xe0; cbw[19] = 0x00;
+\t\t\t\t\tif (ep_in != -1) {
+\t\t\t\t\t\tmemset(csw, 0, 13);
+\t\t\t\t\t\tif (usb_bulk_msg(udev, usb_rcvbulkpipe(udev, ep_in), csw, 13, &actual_len, 1000) == -EPIPE)
+\t\t\t\t\t\t\tusb_clear_halt(udev, usb_rcvbulkpipe(udev, ep_in));
+\t\t\t\t\t}
+\t\t\t\t\t/* 2) SCSI START STOP UNIT / Eject (1b 00 00 00 02 00) + read CSW */
+\t\t\t\t\tmemset(cbw, 0, 31);
+\t\t\t\t\tcbw[0] = 0x55; cbw[1] = 0x53; cbw[2] = 0x42; cbw[3] = 0x43;
+\t\t\t\t\tcbw[4] = 0x02; cbw[14] = 0x06; cbw[15] = 0x1b; cbw[19] = 0x02;
 \t\t\t\t\tusb_bulk_msg(udev, usb_sndbulkpipe(udev, ep_out), cbw, 31, &actual_len, 1000);
-\t\t\t\t\tkfree(cbw);
-\t\t\t\t\tRTW_INFO("RTL8851BU/8831BU: Sent USB modeswitch eject to 0bda:1a2b on ep 0x%02x\\n", ep_out);
+\t\t\t\t\tif (ep_in != -1) {
+\t\t\t\t\t\tmemset(csw, 0, 13);
+\t\t\t\t\t\tif (usb_bulk_msg(udev, usb_rcvbulkpipe(udev, ep_in), csw, 13, &actual_len, 1000) == -EPIPE)
+\t\t\t\t\t\t\tusb_clear_halt(udev, usb_rcvbulkpipe(udev, ep_in));
+\t\t\t\t\t}
+\t\t\t\t\t/* Hold interface lock up to 800ms while dongle disconnects so usb-storage cannot re-bind */
+\t\t\t\t\tfor (w = 0; w < 8; w++) {
+\t\t\t\t\t\tif (udev->state == USB_STATE_NOTATTACHED)
+\t\t\t\t\t\t\tbreak;
+\t\t\t\t\t\tmsleep(100);
+\t\t\t\t\t}
+\t\t\t\t\t/* Fallback: Realtek vendor 0xe0 switch if still attached after StandardEject */
+\t\t\t\t\tif (udev->state != USB_STATE_NOTATTACHED) {
+\t\t\t\t\t\tmemset(cbw, 0, 31);
+\t\t\t\t\t\tcbw[0] = 0x55; cbw[1] = 0x53; cbw[2] = 0x42; cbw[3] = 0x43;
+\t\t\t\t\t\tcbw[4] = 0x03; cbw[14] = 0x06; cbw[15] = 0xe0;
+\t\t\t\t\t\tusb_bulk_msg(udev, usb_sndbulkpipe(udev, ep_out), cbw, 31, &actual_len, 1000);
+\t\t\t\t\t\tif (ep_in != -1) {
+\t\t\t\t\t\t\tmemset(csw, 0, 13);
+\t\t\t\t\t\t\tusb_bulk_msg(udev, usb_rcvbulkpipe(udev, ep_in), csw, 13, &actual_len, 1000);
+\t\t\t\t\t\t}
+\t\t\t\t\t\tfor (w = 0; w < 6; w++) {
+\t\t\t\t\t\t\tif (udev->state == USB_STATE_NOTATTACHED)
+\t\t\t\t\t\t\t\tbreak;
+\t\t\t\t\t\t\tmsleep(100);
+\t\t\t\t\t\t}
+\t\t\t\t\t}
+\t\t\t\t\tprintk(KERN_INFO "RTL8851BU/8831BU: modeswitch eject sent to 0bda:1a2b (ep_out=0x%02x ep_in=0x%02x state=%d)\\n",
+\t\t\t\t\t       ep_out, ep_in, udev->state);
 \t\t\t\t}
+\t\t\t\tkfree(csw);
+\t\t\t\tkfree(cbw);
 \t\t\t}
 \t\t}
+\t\tif (udev && udev->state != USB_STATE_NOTATTACHED)
+\t\t\tudev->dev.devt &= ~0x00080000U;
 \t\treturn -ENODEV;
 \t}
 
