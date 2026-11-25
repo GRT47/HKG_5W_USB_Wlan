@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.8)
+# USB Wireless LAN Card Hotspot (AP) & Client (STA) Daemon for HKG Gen5W (v2.0.10)
 export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin
 export LD_LIBRARY_PATH=/vendor/lib:/system/lib
 export ANDROID_ROOT=/system
@@ -62,7 +62,7 @@ done
 exec >>"$TMP_DIR/daemon_stdout.log" 2>&1
 echo "$$" > "$TMP_DIR/daemon.pid" 2>/dev/null
 # Clear any stale one-shot trigger files left over across reboots
-rm -f "$TMP_DIR/force_restart" "$TMP_DIR/ota_reload_daemon" "$TMP_DIR/trigger_scan" "$TMP_DIR/disconnect_sta" "$TMP_DIR/trigger_modeswitch" "$TMP_DIR/modeswitch_done" 2>/dev/null
+rm -f "$TMP_DIR/force_restart" "$TMP_DIR/ota_reload_daemon" "$TMP_DIR/trigger_scan" "$TMP_DIR/disconnect_sta" "$TMP_DIR/sta_paused" "$TMP_DIR/trigger_modeswitch" "$TMP_DIR/modeswitch_done" "$TMP_DIR/wpa_ctrl_req" "$TMP_DIR/wpa_ctrl_done" 2>/dev/null
 
 load_config() {
     USB_VID="0bda"
@@ -103,9 +103,16 @@ parse_kv_file() {
             *" $_k "*) ;;
             *) continue ;;
         esac
-        case "$_v" in
-            \"*\") _v="${_v#\"}"; _v="${_v%\"}" ;;
-            \'*\') _v="${_v#\'}"; _v="${_v%\'}" ;;
+        case "$_k" in
+            AP_SSID|AP_PASS|STA_SSID|STA_PASS)
+                # Preserve literal quotes and spaces inside Wi-Fi credentials
+                ;;
+            *)
+                case "$_v" in
+                    \"*\") _v="${_v#\"}"; _v="${_v%\"}" ;;
+                    \'*\') _v="${_v#\'}"; _v="${_v%\'}" ;;
+                esac
+                ;;
         esac
         eval "$_k=\$_v"
     done < "$_f"
@@ -213,14 +220,124 @@ sta_link_up() {
     [ "$_os" = "up" ]
 }
 
-# Android's wpa_supplicant never scans on its own at startup (the framework normally sends
-# SCAN/RECONNECT over the control socket, and there is no wpa_cli here). SIGHUP makes it reload
-# its config, which ends with a scan request when networks are enabled -> scan + associate.
+is_ui_daemon_alive() {
+    local _upid _ufd
+    if [ -f "$TMP_DIR/ui_java.pid" ]; then
+        read -r _upid < "$TMP_DIR/ui_java.pid" 2>/dev/null
+        if [ -n "$_upid" ] && [ -d "/proc/$_upid" ] && kill -0 "$_upid" 2>/dev/null; then
+            _ufd="$(readlink "/proc/$_upid/fd/1" 2>/dev/null)"
+            case "$_ufd" in
+                *usbwifi_hotspot/ui.log*) return 0 ;;
+            esac
+        fi
+    fi
+    return 1
+}
+
+# Escape backslash and double-quote for wpa_supplicant.conf quoted string fields
+wpa_escape() {
+    local _s="$1" _seg _r1="" _r2=""
+    while :; do
+        case "$_s" in
+            *\\*)
+                _seg="${_s%%\\*}"
+                _s="${_s#*\\}"
+                _r1="${_r1}${_seg}"'\\'
+                ;;
+            *)
+                _r1="${_r1}${_s}"
+                break
+                ;;
+        esac
+    done
+    _s="$_r1"
+    while :; do
+        case "$_s" in
+            *\"*)
+                _seg="${_s%%\"*}"
+                _s="${_s#*\"}"
+                _r2="${_r2}${_seg}"'\"'
+                ;;
+            *)
+                _r2="${_r2}${_s}"
+                break
+                ;;
+        esac
+    done
+    printf '%s' "$_r2"
+}
+
+write_wpa_network_block() {
+    local _conf="$1" _ssid="$2" _pass="$3" _prio="$4" _essid _epass
+    [ -n "$_ssid" ] || return 0
+    _essid="$(wpa_escape "$_ssid")"
+    if [ -n "$_pass" ]; then
+        _epass="$(wpa_escape "$_pass")"
+        printf 'network={\n    ssid="%s"\n    scan_ssid=1\n    key_mgmt=WPA-PSK\n    psk="%s"\n    priority=%s\n}\n' \
+            "$_essid" "$_epass" "$_prio" >> "$_conf"
+    else
+        printf 'network={\n    ssid="%s"\n    scan_ssid=1\n    key_mgmt=NONE\n    priority=%s\n}\n' \
+            "$_essid" "$_prio" >> "$_conf"
+    fi
+}
+
+send_wpa_ctrl() {
+    local _iface="$1" _action="$2" _allow_oneshot="${3:-1}" _w _rc=1
+    [ -n "$_iface" ] && [ -n "$_action" ] || return 1
+    [ -S "$WIFI_WORK_DIR/wpa_ctrl/$_iface" ] || [ -e "$WIFI_WORK_DIR/wpa_ctrl/$_iface" ] || return 1
+    if [ -x /system/bin/wpa_cli ]; then
+        case "$_action" in
+            KICK_CONNECT)
+                /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" enable_network all >/dev/null 2>&1
+                /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" reconnect >/dev/null 2>&1 && return 0
+                ;;
+            SCAN)
+                /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" scan >/dev/null 2>&1 && return 0
+                ;;
+            POLL)
+                /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" status > "$TMP_DIR/wpa_status.txt" 2>/dev/null
+                /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" signal_poll > "$TMP_DIR/wpa_signal.txt" 2>/dev/null
+                /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" scan_results > "$TMP_DIR/sta_scan.txt" 2>/dev/null
+                return 0
+                ;;
+        esac
+    fi
+    if is_ui_daemon_alive; then
+        rm -f "$TMP_DIR/wpa_ctrl_done" 2>/dev/null
+        printf '%s %s\n' "$_iface" "$_action" > "$TMP_DIR/wpa_ctrl_req.tmp" 2>/dev/null && \
+            mv "$TMP_DIR/wpa_ctrl_req.tmp" "$TMP_DIR/wpa_ctrl_req" 2>/dev/null
+        for _w in 1 2 3 4 5 6 7 8 9 10; do
+            if [ -f "$TMP_DIR/wpa_ctrl_done" ]; then
+                read -r _rc < "$TMP_DIR/wpa_ctrl_done" 2>/dev/null
+                rm -f "$TMP_DIR/wpa_ctrl_done" 2>/dev/null
+                [ "$_rc" = "0" ] && return 0
+                return 1
+            fi
+            usleep 200000 2>/dev/null || sleep 1
+        done
+        rm -f "$TMP_DIR/wpa_ctrl_req" 2>/dev/null
+        return 1
+    elif [ "$_allow_oneshot" = "1" ]; then
+        CLASSPATH="$APP_DIR/bin/usbwifistatus.jar" /system/bin/app_process /system/bin com.hkg.usbwifi.UsbWifiStatusMain wpa-ctrl "$_iface" "$_action" >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+# Send RECONNECT/SCAN via wpa_ctrl socket first (reliable on Android wpa_supplicant), falling back to SIGHUP.
 kick_wpa_scan() {
-    local _why="$1" _kp=""
+    local _iface="$1" _why="$2" _kp="" _fd1
+    if send_wpa_ctrl "$_iface" "KICK_CONNECT" 1; then
+        log_info "STA: triggered wpa_supplicant RECONNECT via ctrl socket ($_why)"
+        return 0
+    fi
     [ "$STA_NO_HUP" = "1" ] && return 0
     read -r _kp < "$TMP_DIR/wpa_supplicant.pid" 2>/dev/null
     [ -n "$_kp" ] && [ -d "/proc/$_kp" ] || return 0
+    _fd1="$(readlink "/proc/$_kp/fd/1" 2>/dev/null)"
+    case "$_fd1" in
+        *usbwifi_hotspot/wpa_supplicant.log*) ;;
+        *) return 0 ;;
+    esac
     log_info "STA: requesting wpa_supplicant scan/reconnect via SIGHUP ($_why)"
     kill -HUP "$_kp" 2>/dev/null
     sleep 1
@@ -230,15 +347,77 @@ kick_wpa_scan() {
     fi
 }
 
-# Keep the wpa_supplicant logcat streamer alive (restart if it died)
+# Keep the wpa_supplicant logcat streamer alive (restart if it died or PID reused)
 ensure_wpa_log_streamer() {
-    local _lp=""
+    local _lp="" _lfd=""
     read -r _lp < "$TMP_DIR/wpa_logcat.pid" 2>/dev/null
-    if [ -z "$_lp" ] || [ ! -d "/proc/$_lp" ]; then
-        echo "--- $(date) wpa log streamer (re)started ---" >> "$TMP_DIR/wpa_supplicant.log" 2>/dev/null
-        logcat -v time -s wpa_supplicant:V >> "$TMP_DIR/wpa_supplicant.log" 2>/dev/null &
-        echo $! > "$TMP_DIR/wpa_logcat.pid"
+    if [ -n "$_lp" ] && [ -d "/proc/$_lp" ]; then
+        _lfd="$(readlink "/proc/$_lp/fd/1" 2>/dev/null)"
+        case "$_lfd" in
+            *usbwifi_hotspot/wpa_supplicant.log*) return 0 ;;
+        esac
     fi
+    echo "--- $(date) wpa log streamer (re)started ---" >> "$TMP_DIR/wpa_supplicant.log" 2>/dev/null
+    logcat -v time -s wpa_supplicant:V >> "$TMP_DIR/wpa_supplicant.log" 2>/dev/null &
+    echo $! > "$TMP_DIR/wpa_logcat.pid"
+}
+
+# Restore stock LTE DNS resolver so head unit telematics/apps never stay pinned to a dead STA interface.
+restore_system_dns() {
+    local _sta_if="$1" _def_if="" _rm
+    [ -n "$_sta_if" ] && ndc resolver flushif "$_sta_if" >/dev/null 2>&1
+    _def_if="$(ip route show table main 2>/dev/null | while read -r _k _v _gw _d _dev _rest; do
+        if [ "$_k" = "default" ] && [ "$_d" = "dev" ]; then
+            case "$_dev" in
+                rtwlan*|wlan*) continue ;;
+                *) echo "$_dev"; break ;;
+            esac
+        fi
+    done)"
+    if [ -z "$_def_if" ]; then
+        for _rm in rmnet0 rmnet1; do
+            if ip -4 addr show dev "$_rm" 2>/dev/null | grep -q "inet "; then
+                _def_if="$_rm"
+                break
+            fi
+        done
+    fi
+    if [ -n "$_def_if" ]; then
+        ndc resolver setdefaultif "$_def_if" >/dev/null 2>&1
+    fi
+}
+
+# Tear down dhcpcd, policy rules, table 62, IPv4 addresses, and stale DNS for STA (used on disconnect/roam/stop).
+clear_sta_network_state() {
+    local _iface="$1" _p _fd1 _if _n
+    kill_pid_file "$TMP_DIR/dhcpcd.pid"
+    for _if in "$_iface" "$ACTIVE_IFACE" rtwlan0 rtwlan1 wlan1; do
+        [ -n "$_if" ] || continue
+        kill_pid_file "/data/misc/dhcp/dhcpcd-${_if}.pid"
+    done
+    for _p in /proc/[0-9]*; do
+        _p="${_p#/proc/}"
+        [ "$_p" = "$$" ] && continue
+        _fd1="$(readlink "/proc/$_p/fd/1" 2>/dev/null)"
+        case "$_fd1" in
+            *usbwifi_hotspot/dhcpcd.log*) kill "$_p" 2>/dev/null ;;
+        esac
+    done
+    for _n in 1 2 3 4; do
+        ip rule del pref 9780 2>/dev/null
+        ip rule del pref 9785 2>/dev/null
+        ip rule del pref 9786 2>/dev/null
+        ip rule del pref 9790 2>/dev/null
+        ip rule del pref 9800 2>/dev/null
+    done
+    ip route flush table 62 2>/dev/null
+    if [ -n "$_iface" ] && [ -d "/sys/class/net/$_iface" ]; then
+        ip -4 addr flush dev "$_iface" >/dev/null 2>&1
+    fi
+    restore_system_dns "$_iface"
+    STA_NET_KEY=""
+    STA_DNS_TICK=0
+    STA_ACTIVE_NET=""
 }
 
 # Truncate an append-only log once it exceeds $2 bytes (O_APPEND writers simply continue at offset 0)
@@ -266,26 +445,25 @@ stop_sta_daemons() {
     local _p _fd1 _if
     kill_pid_file "$TMP_DIR/wpa_supplicant.pid"
     kill_pid_file "$TMP_DIR/wpa_logcat.pid"
-    kill_pid_file "$TMP_DIR/dhcpcd.pid"
-    for _if in "$ACTIVE_IFACE" rtwlan0 rtwlan1 wlan1; do
-        [ -n "$_if" ] || continue
-        kill_pid_file "/data/misc/dhcp/dhcpcd-${_if}.pid"
-    done
     for _p in /proc/[0-9]*; do
         _p="${_p#/proc/}"
         [ "$_p" = "$$" ] && continue
         _fd1="$(readlink "/proc/$_p/fd/1" 2>/dev/null)"
         case "$_fd1" in
-            *usbwifi_hotspot/wpa_supplicant.log*|*usbwifi_hotspot/dhcpcd.log*)
+            *usbwifi_hotspot/wpa_supplicant.log*)
                 kill "$_p" 2>/dev/null
                 ;;
         esac
     done
-    rm -f "$TMP_DIR/wpa_status.txt" "$TMP_DIR/wpa_signal.txt" 2>/dev/null
-    ip rule del pref 9790 2>/dev/null
-    ip rule del pref 9800 2>/dev/null
-    ip route flush table 62 2>/dev/null
-    STA_NET_KEY=""
+    clear_sta_network_state "$ACTIVE_IFACE"
+    for _if in "$ACTIVE_IFACE" rtwlan0 rtwlan1 wlan1; do
+        [ -n "$_if" ] || continue
+        iptables -D INPUT -i "$_if" -j ACCEPT 2>/dev/null
+        iptables -D OUTPUT -o "$_if" -j ACCEPT 2>/dev/null
+    done
+    rm -f "$WIFI_WORK_DIR/wpa_ctrl/cli_"*.sock "$TMP_DIR/wpa_status.txt" "$TMP_DIR/wpa_signal.txt" 2>/dev/null
+    STA_DISCONN_TICKS=0
+    STA_POLL_TICK=0
 }
 
 # Remove NAT / DNAT / routing state recorded by start_hotspot_on_iface (survives daemon re-exec)
@@ -522,6 +700,10 @@ STA_NET_KEY=""
 STA_DNS_TICK=0
 STA_KICK_TICK=0
 STA_NO_HUP=0
+STA_DISCONN_TICKS=0
+STA_POLL_TICK=0
+STA_HAS_NETWORKS=0
+STA_ACTIVE_NET=""
 
 load_single_ko() {
     local _mbase="$1" _plat _target_ko _all_args
@@ -872,7 +1054,9 @@ EOF
 }
 
 start_sta_on_iface() {
-    local _iface="$1" _prio=100 _s_ssid _s_pass _wpid
+    local _iface="$1" _prio=100 _s_line _s_ssid _s_pass _wpid _has_net=0 _tab _cr
+    _tab="$(printf '\t')"
+    _cr="$(printf '\r')"
     load_config
     stop_ap_daemons
     stop_sta_daemons
@@ -893,52 +1077,45 @@ start_sta_on_iface() {
     ip -4 addr flush dev "$_iface" >/dev/null 2>&1
 
     mkdir -p "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
-    rm -f "$WIFI_WORK_DIR/wpa_supplicant.conf" 2>/dev/null
+    rm -f "$WIFI_WORK_DIR/wpa_supplicant.conf" "$WIFI_WORK_DIR/wpa_ctrl/cli_"*.sock 2>/dev/null
     cat > "$WIFI_WORK_DIR/wpa_supplicant.conf" <<EOF
 ctrl_interface=$WIFI_WORK_DIR/wpa_ctrl
 ap_scan=1
+country=KR
 EOF
-    if [ -n "$STA_SSID" ]; then
-        if [ -n "$STA_PASS" ]; then
-            cat >> "$WIFI_WORK_DIR/wpa_supplicant.conf" <<EOF
-network={
-    ssid="$STA_SSID"
-    scan_ssid=1
-    key_mgmt=WPA-PSK
-    psk="$STA_PASS"
-    priority=100
-}
-EOF
-        else
-            cat >> "$WIFI_WORK_DIR/wpa_supplicant.conf" <<EOF
-network={
-    ssid="$STA_SSID"
-    scan_ssid=1
-    key_mgmt=NONE
-    priority=100
-}
-EOF
+    if [ ! -f "$TMP_DIR/sta_paused" ]; then
+        if [ -n "$STA_SSID" ]; then
+            write_wpa_network_block "$WIFI_WORK_DIR/wpa_supplicant.conf" "$STA_SSID" "$STA_PASS" 100
+            _has_net=1
         fi
         if [ -f "$SAVED_STA_FILE" ]; then
-            while IFS='=' read -r _s_ssid _s_pass; do
+            while IFS= read -r _s_line || [ -n "$_s_line" ]; do
+                _s_line="${_s_line%$_cr}"
+                [ -n "$_s_line" ] || continue
+                case "$_s_line" in
+                    *"$_tab"*)
+                        _s_ssid="${_s_line%%$_tab*}"
+                        _s_pass="${_s_line#*$_tab}"
+                        ;;
+                    *=*)
+                        _s_ssid="${_s_line%%=*}"
+                        _s_pass="${_s_line#*=}"
+                        ;;
+                    *)
+                        _s_ssid="$_s_line"
+                        _s_pass=""
+                        ;;
+                esac
                 [ -n "$_s_ssid" ] || continue
                 [ "$_s_ssid" = "$STA_SSID" ] && continue
                 _prio=$((_prio - 10))
                 [ "$_prio" -lt 10 ] && _prio=10
-                if [ -n "$_s_pass" ]; then
-                    cat >> "$WIFI_WORK_DIR/wpa_supplicant.conf" <<EOF
-network={
-    ssid="$_s_ssid"
-    scan_ssid=1
-    key_mgmt=WPA-PSK
-    psk="$_s_pass"
-    priority=$_prio
-}
-EOF
-                fi
+                write_wpa_network_block "$WIFI_WORK_DIR/wpa_supplicant.conf" "$_s_ssid" "$_s_pass" "$_prio"
+                _has_net=1
             done < "$SAVED_STA_FILE"
         fi
     fi
+    STA_HAS_NETWORKS="$_has_net"
     chown 1010:1010 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
     chmod 777 "$WIFI_WORK_DIR" "$WIFI_WORK_DIR/wpa_ctrl" 2>/dev/null
     prepare_wifi_conf "$WIFI_WORK_DIR/wpa_supplicant.conf"
@@ -968,39 +1145,42 @@ EOF
         sleep 2
     fi
     STA_KICK_TICK=0
-    [ -n "$STA_SSID" ] && kick_wpa_scan "initial connect to $STA_SSID"
-    if [ -z "$STA_SSID" ]; then
-        sleep 1
-        for _rproc in "/proc/net/rtl88x2bu/$_iface" "/proc/net/rtl8851bu/$_iface"; do
-            [ -w "$_rproc/survey_info" ] && echo 1 > "$_rproc/survey_info" 2>/dev/null
-        done
-        [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" scan >/dev/null 2>&1
+    STA_DISCONN_TICKS=0
+    STA_POLL_TICK=0
+    STA_ACTIVE_NET=""
+    if [ "$STA_HAS_NETWORKS" = "1" ]; then
+        kick_wpa_scan "$_iface" "initial connect (target=${STA_SSID:-saved})"
         sleep 4
     else
-        # When connecting to a target SSID, let wpa_supplicant perform its own nl80211 scan+associate
-        # without interrupting it via /proc/.../survey_info
+        if ! send_wpa_ctrl "$_iface" "SCAN" 1; then
+            for _rproc in "/proc/net/rtl88x2bu/$_iface" "/proc/net/rtl8851bu/$_iface"; do
+                [ -w "$_rproc/survey_info" ] && echo 1 > "$_rproc/survey_info" 2>/dev/null
+            done
+        fi
         sleep 4
     fi
+    send_wpa_ctrl "$_iface" "POLL" 0
     for _rproc in "/proc/net/rtl88x2bu/$_iface" "/proc/net/rtl8851bu/$_iface"; do
         [ -f "$_rproc/survey_info" ] && cat "$_rproc/survey_info" > "$TMP_DIR/sta_survey.txt" 2>/dev/null
         [ -f "$_rproc/ap_info" ] && cat "$_rproc/ap_info" > "$TMP_DIR/sta_ap_info.txt" 2>/dev/null
         [ -f "$_rproc/rx_signal" ] && cat "$_rproc/rx_signal" > "$TMP_DIR/sta_rx_signal.txt" 2>/dev/null
     done
-    if [ -x /system/bin/wpa_cli ]; then
-        /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" scan_results > "$TMP_DIR/sta_scan.txt" 2>/dev/null
-        /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" status > "$TMP_DIR/wpa_status.txt" 2>/dev/null
-    fi
     log_info "Client (STA) wpa_supplicant started on $_iface"
     save_active_snapshot
 }
 
 is_sta_healthy() {
-    local _iface="$1" _wpid _cpid _sta_ip _gw _dns1 _assoc=0 _rproc
+    local _iface="$1" _wpid _wfd _cpid _cfd _sta_cidr _sta_ip _sta_net _gw _dns1 _dns2 _w0_net _rm _rm_ip _rtbl _rpref _assoc=0 _rproc _cur_net=""
     [ -n "$_iface" ] || return 1
     [ -d "/sys/class/net/$_iface" ] || return 1
     if [ -f "$TMP_DIR/wpa_supplicant.pid" ]; then
         read -r _wpid < "$TMP_DIR/wpa_supplicant.pid" 2>/dev/null
         [ -n "$_wpid" ] && [ -d "/proc/$_wpid" ] || return 1
+        _wfd="$(readlink "/proc/$_wpid/fd/1" 2>/dev/null)"
+        case "$_wfd" in
+            *usbwifi_hotspot/wpa_supplicant.log*) ;;
+            *) return 1 ;;
+        esac
     else
         return 1
     fi
@@ -1011,32 +1191,36 @@ is_sta_healthy() {
     done
     cap_log_file "$TMP_DIR/wpa_supplicant.log" 262144
     ensure_wpa_log_streamer
-    if [ -x /system/bin/wpa_cli ]; then
-        /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" status > "$TMP_DIR/wpa_status.txt" 2>/dev/null
-        /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" signal_poll > "$TMP_DIR/wpa_signal.txt" 2>/dev/null
-        /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$_iface" scan_results > "$TMP_DIR/sta_scan.txt" 2>/dev/null
+    if [ ! -f "$TMP_DIR/wpa_status.txt" ] || [ "$STA_POLL_TICK" -eq 0 ]; then
+        send_wpa_ctrl "$_iface" "POLL" 0
     fi
+    STA_POLL_TICK=$((STA_POLL_TICK + 1))
+    [ "$STA_POLL_TICK" -ge 3 ] && STA_POLL_TICK=0
     if grep -q "^wpa_state=COMPLETED" "$TMP_DIR/wpa_status.txt" 2>/dev/null; then
         _assoc=1
     elif sta_link_up "$_iface"; then
         _assoc=1
     fi
     if [ "$_assoc" = "1" ]; then
+        STA_DISCONN_TICKS=0
         STA_KICK_TICK=0
-    elif [ -n "$STA_SSID" ]; then
-        # Not associated: re-kick wpa_supplicant every ~30s (it does not retry by itself until a first scan ran)
-        STA_KICK_TICK=$((STA_KICK_TICK + 1))
-        if [ "$STA_KICK_TICK" -ge 6 ]; then
-            STA_KICK_TICK=0
-            kick_wpa_scan "still not associated with $STA_SSID"
+        _cur_net="$(grep -E '^(bssid|ssid)=' "$TMP_DIR/wpa_status.txt" 2>/dev/null | head -n 1)"
+        [ -z "$_cur_net" ] && _cur_net="$(grep '^SSID=' "$TMP_DIR/sta_ap_info.txt" 2>/dev/null | head -n 1)"
+        if [ -n "$STA_ACTIVE_NET" ] && [ -n "$_cur_net" ] && [ "$_cur_net" != "$STA_ACTIVE_NET" ]; then
+            log_info "STA roamed ($STA_ACTIVE_NET -> $_cur_net) -> refreshing DHCP"
+            clear_sta_network_state "$_iface"
         fi
-    fi
-    if [ "$_assoc" = "1" ]; then
+        STA_ACTIVE_NET="$_cur_net"
         if ! ip -4 addr show dev "$_iface" 2>/dev/null | grep -q "inet "; then
             local _dhcp_running=0
             if [ -f "$TMP_DIR/dhcpcd.pid" ]; then
                 read -r _cpid < "$TMP_DIR/dhcpcd.pid" 2>/dev/null
-                [ -n "$_cpid" ] && [ -d "/proc/$_cpid" ] && _dhcp_running=1
+                if [ -n "$_cpid" ] && [ -d "/proc/$_cpid" ]; then
+                    _cfd="$(readlink "/proc/$_cpid/fd/1" 2>/dev/null)"
+                    case "$_cfd" in
+                        *usbwifi_hotspot/dhcpcd.log*) _dhcp_running=1 ;;
+                    esac
+                fi
             fi
             if [ "$_dhcp_running" = "0" ]; then
                 log_info "STA connected on $_iface -> starting dhcpcd"
@@ -1046,33 +1230,84 @@ is_sta_healthy() {
                 sleep 3
             fi
         fi
-        _sta_ip="$(ip -4 addr show dev "$_iface" 2>/dev/null | grep 'inet ' | while read -r _a _b _rest; do echo "${_b%%/*}"; break; done)"
+        _sta_cidr="$(ip -4 addr show dev "$_iface" 2>/dev/null | grep 'inet ' | while read -r _a _b _rest; do echo "$_b"; break; done)"
+        _sta_ip="${_sta_cidr%%/*}"
         if [ -n "$_sta_ip" ]; then
+            _sta_net="$(ip -4 route show dev "$_iface" proto kernel scope link 2>/dev/null | while read -r _n _rest; do case "$_n" in */*) echo "$_n"; break ;; esac; done)"
+            [ -z "$_sta_net" ] && _sta_net="${_sta_ip%.*}.0/24"
             _gw="$(getprop dhcp.${_iface}.gateway 2>/dev/null)"
+            [ -z "$_gw" ] && _gw="$(ip -4 route show dev "$_iface" 2>/dev/null | while read -r _k _v _g _rest; do [ "$_k" = "default" ] && [ "$_v" = "via" ] && { echo "$_g"; break; }; done)"
             [ -z "$_gw" ] && _gw="${_sta_ip%.*}.1"
             _dns1="$(getprop dhcp.${_iface}.dns1 2>/dev/null)"
             [ -z "$_dns1" ] && _dns1="8.8.8.8"
+            _dns2="$(getprop dhcp.${_iface}.dns2 2>/dev/null)"
+            if [ -z "$_dns2" ]; then
+                [ "$_dns1" = "8.8.8.8" ] && _dns2="1.1.1.1" || _dns2="8.8.8.8"
+            fi
+            _w0_net=""
+            if [ "$_iface" != "wlan0" ] && [ -d /sys/class/net/wlan0 ]; then
+                _w0_net="$(ip -4 route show dev wlan0 proto kernel scope link 2>/dev/null | while read -r _n _rest; do case "$_n" in */*) echo "$_n"; break ;; esac; done)"
+            fi
             # Re-apply routing/DNS only when the lease changed or a rule went missing
-            # (avoids deleting + re-adding the default rule every 5s, which briefly drops traffic)
-            if [ "$STA_NET_KEY" != "$_iface $_sta_ip $_gw $_dns1" ] \
+            if [ "$STA_NET_KEY" != "$_iface $_sta_cidr $_gw $_dns1" ] \
                 || ! ip rule show 2>/dev/null | grep -q "^9800:.*lookup 62" \
                 || ! ip route show table 62 2>/dev/null | grep -q "^default via $_gw "; then
-                ip route replace "${_sta_ip%.*}.0/24" dev "$_iface" src "$_sta_ip" table 62 >/dev/null 2>&1
-                ip route replace default via "$_gw" dev "$_iface" table 62 >/dev/null 2>&1
+                ip route replace "$_sta_net" dev "$_iface" src "$_sta_ip" table 62 >/dev/null 2>&1
+                ip route replace default via "$_gw" dev "$_iface" src "$_sta_ip" table 62 >/dev/null 2>&1
+                ip rule del pref 9780 2>/dev/null
+                ip rule del pref 9785 2>/dev/null
+                ip rule del pref 9786 2>/dev/null
                 ip rule del pref 9790 2>/dev/null
                 ip rule del pref 9800 2>/dev/null
-                ip rule add pref 9790 to "${_sta_ip%.*}.0/24" lookup main 2>/dev/null
+                if [ -n "$_w0_net" ] && [ "$_w0_net" != "$_sta_net" ]; then
+                    ip rule add pref 9780 to "$_w0_net" lookup main 2>/dev/null
+                fi
+                for _rm in rmnet0 rmnet1; do
+                    [ "$_rm" = "rmnet0" ] && _rpref=9785 || _rpref=9786
+                    _rm_ip="$(ip -4 addr show dev "$_rm" 2>/dev/null | grep 'inet ' | while read -r _a _b _rest; do echo "${_b%%/*}"; break; done)"
+                    if [ -n "$_rm_ip" ]; then
+                        if ip route show table 60 2>/dev/null | grep -q " dev $_rm "; then
+                            _rtbl=60
+                        elif ip route show table 61 2>/dev/null | grep -q " dev $_rm "; then
+                            _rtbl=61
+                        else
+                            _rtbl=main
+                        fi
+                        ip rule add pref "$_rpref" from "$_rm_ip/32" lookup "$_rtbl" 2>/dev/null
+                    fi
+                done
+                if [ "$_sta_net" != "$_w0_net" ]; then
+                    ip rule add pref 9790 to "$_sta_net" lookup main 2>/dev/null
+                fi
                 ip rule add pref 9800 from all lookup 62 2>/dev/null
-                STA_NET_KEY="$_iface $_sta_ip $_gw $_dns1"
+                STA_NET_KEY="$_iface $_sta_cidr $_gw $_dns1"
                 STA_DNS_TICK=0
             fi
             # DNS can be reset by ConnectivityService (e.g. LTE reconnect): re-assert every ~60s (no traffic gap)
             if [ "$STA_DNS_TICK" -eq 0 ]; then
-                ndc resolver setifdns "$_iface" "" "$_dns1" "8.8.8.8" >/dev/null 2>&1
+                ndc resolver setifdns "$_iface" "" "$_dns1" "$_dns2" >/dev/null 2>&1
                 ndc resolver setdefaultif "$_iface" >/dev/null 2>&1
             fi
             STA_DNS_TICK=$((STA_DNS_TICK + 1))
             [ "$STA_DNS_TICK" -ge 12 ] && STA_DNS_TICK=0
+        fi
+    else
+        STA_DISCONN_TICKS=$((STA_DISCONN_TICKS + 1))
+        if [ "$STA_DISCONN_TICKS" -ge 2 ]; then
+            if [ -n "$STA_NET_KEY" ] \
+                || ip -4 addr show dev "$_iface" 2>/dev/null | grep -q "inet " \
+                || ip rule show 2>/dev/null | grep -q "^9800:.*lookup 62"; then
+                log_info "STA disconnected on $_iface -> clearing STA routing/IP and restoring LTE"
+                clear_sta_network_state "$_iface"
+            fi
+        fi
+        if [ "$STA_HAS_NETWORKS" = "1" ]; then
+            # Not associated: re-kick wpa_supplicant every ~30s
+            STA_KICK_TICK=$((STA_KICK_TICK + 1))
+            if [ "$STA_KICK_TICK" -ge 6 ]; then
+                STA_KICK_TICK=0
+                kick_wpa_scan "$_iface" "still not associated (target=${STA_SSID:-saved})"
+            fi
         fi
     fi
     return 0
@@ -1161,16 +1396,17 @@ while true; do
     if [ -f "$TMP_DIR/trigger_scan" ]; then
         rm -f "$TMP_DIR/trigger_scan" 2>/dev/null
         if [ -n "$ACTIVE_IFACE" ] && [ "$WIFI_MODE" = "sta" ]; then
-            for _rproc in "/proc/net/rtl88x2bu/$ACTIVE_IFACE" "/proc/net/rtl8851bu/$ACTIVE_IFACE"; do
-                [ -w "$_rproc/survey_info" ] && echo 1 > "$_rproc/survey_info" 2>/dev/null
-            done
-            [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$ACTIVE_IFACE" scan >/dev/null 2>&1
-            sta_link_up "$ACTIVE_IFACE" || kick_wpa_scan "scan requested from dashboard"
+            if ! send_wpa_ctrl "$ACTIVE_IFACE" "SCAN" 1; then
+                for _rproc in "/proc/net/rtl88x2bu/$ACTIVE_IFACE" "/proc/net/rtl8851bu/$ACTIVE_IFACE"; do
+                    [ -w "$_rproc/survey_info" ] && echo 1 > "$_rproc/survey_info" 2>/dev/null
+                done
+                sta_link_up "$ACTIVE_IFACE" || kick_wpa_scan "$ACTIVE_IFACE" "scan requested from dashboard"
+            fi
             sleep 4
+            send_wpa_ctrl "$ACTIVE_IFACE" "POLL" 0
             for _rproc in "/proc/net/rtl88x2bu/$ACTIVE_IFACE" "/proc/net/rtl8851bu/$ACTIVE_IFACE"; do
                 [ -f "$_rproc/survey_info" ] && cat "$_rproc/survey_info" > "$TMP_DIR/sta_survey.txt" 2>/dev/null
             done
-            [ -x /system/bin/wpa_cli ] && /system/bin/wpa_cli -p "$WIFI_WORK_DIR/wpa_ctrl" -i "$ACTIVE_IFACE" scan_results > "$TMP_DIR/sta_scan.txt" 2>/dev/null
         fi
     fi
     if [ -f "$TMP_DIR/disconnect_sta" ]; then
@@ -1180,6 +1416,7 @@ while true; do
             stop_sta_daemons
             rm -f "$TMP_DIR/sta_ap_info.txt" "$TMP_DIR/wpa_status.txt" 2>/dev/null
             ip -4 addr flush dev "$ACTIVE_IFACE" >/dev/null 2>&1
+            ACTIVE_IFACE=""
         fi
     fi
     if is_usb_dongle_present; then

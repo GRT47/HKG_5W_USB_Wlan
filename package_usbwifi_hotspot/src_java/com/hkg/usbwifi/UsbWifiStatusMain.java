@@ -9,6 +9,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationHandler;
@@ -28,11 +29,14 @@ import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManager;
@@ -47,7 +51,7 @@ import javax.net.ssl.X509TrustManager;
  *  - Background Daemon status (PID / running state)
  *  - USB Dongle (Realtek RTL8812BU/8822BU 0bda:b812 & RTL8831BU/8851BU 0bda:b831/b851) connection, USB bus path & link speed
  *  - Kernel Module (88x2bu*.ko / 8851bu*.ko) load state, memory size & insmod logs
- *  - USB Wi-Fi Network Interface (rtwlan0 / wlan1 / wlan0) UP/DOWN state, IPv4/prefix, MAC, RX/TX traffic
+ *  - USB Wi-Fi Network Interface (rtwlan0 / rtwlan1 / wlan1) UP/DOWN state, IPv4/prefix, MAC, RX/TX traffic
  *  - Built-in Wi-Fi (bcmdhd / wlan0) coexistence status
  *  - SoftAP (hostapd) & DHCP (dnsmasq) state, SSID, password, band/channel, connected clients
  *  - Live tail of daemon.log & hostapd.log
@@ -55,7 +59,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class UsbWifiStatusMain {
 
-    public static final String UI_VERSION = "2.0.9";
+    public static final String UI_VERSION = "2.0.10";
     public static final String GITHUB_RAW_HOST = "raw.githubusercontent.com";
     public static final String GITHUB_OTA_BASE_PATH = "/GRT47/HKG_5W_USB_Wlan/main/ota";
     private static final Charset UTF8 = Charset.forName("UTF-8");
@@ -170,7 +174,7 @@ public class UsbWifiStatusMain {
         public boolean staConnected = false;
         public String staConnectedSsid = "";
         public String staBand = "2.4GHz";
-        public String staRssi = "-50 dBm";
+        public String staRssi = "-- dBm";
         public List<ScanEntry> staScanList = new ArrayList<ScanEntry>();
         public List<String> savedStaList = new ArrayList<String>();
 
@@ -199,12 +203,12 @@ public class UsbWifiStatusMain {
         if (!"sta".equals(snap.wifiMode)) {
             snap.wifiMode = "ap";
         }
-        snap.apSsid = stripQuotes( getOrDefault(conf, "AP_SSID", "HKG_USB_Hotspot") );
-        snap.apPass = stripQuotes( getOrDefault(conf, "AP_PASS", "12345678") );
+        snap.apSsid = getOrDefault(conf, "AP_SSID", "HKG_USB_Hotspot");
+        snap.apPass = getOrDefault(conf, "AP_PASS", "12345678");
         snap.apHwMode = stripQuotes( getOrDefault(conf, "AP_HW_MODE", "g") );
         snap.apChannel = stripQuotes( getOrDefault(conf, "AP_CHANNEL", "6") );
-        snap.staSsid = stripQuotes( getOrDefault(conf, "STA_SSID", "") );
-        snap.staPass = stripQuotes( getOrDefault(conf, "STA_PASS", "") );
+        snap.staSsid = getOrDefault(conf, "STA_SSID", "");
+        snap.staPass = getOrDefault(conf, "STA_PASS", "");
         snap.forceSubnet = stripQuotes( getOrDefault(conf, "FORCE_SUBNET", "AUTO") );
         snap.enableLteNat = stripQuotes( getOrDefault(conf, "ENABLE_LTE_NAT", "1") );
         snap.autoUpdate = stripQuotes( getOrDefault(conf, "AUTO_UPDATE", "1") );
@@ -499,8 +503,19 @@ public class UsbWifiStatusMain {
                 snap.wpaSuppPid = wpid;
             }
         }
+        if (!snap.wpaSuppAlive) {
+            String wpid = findPidByCmdline("usbwifi_hotspot/wpa_supplicant.conf");
+            if (!wpid.isEmpty()) {
+                snap.wpaSuppAlive = true;
+                snap.wpaSuppPid = wpid;
+            }
+        }
+        if ("sta".equals(snap.wifiMode) && snap.wpaSuppAlive && !snap.usbIface.isEmpty()
+                && new File(WIFI_WORK_DIR_PATH + "/wpa_ctrl/" + snap.usbIface).exists()) {
+            handleWpaCtrlRequest(snap.usbIface, "POLL");
+        }
         File wpaStatusFile = new File(tmpDir, "wpa_status.txt");
-        if (wpaStatusFile.isFile()) {
+        if (wpaStatusFile.isFile() && snap.wpaSuppAlive) {
             Map<String, String> wstat = parseKeyValueFile(wpaStatusFile);
             String wstate = getOrDefault(wstat, "wpa_state", "");
             if ("COMPLETED".equalsIgnoreCase(wstate)) {
@@ -512,7 +527,7 @@ public class UsbWifiStatusMain {
         }
         // The driver's ap_info keeps showing our own AP ("SSID=HKG_USB_Hotspot") after AP -> STA, so only
         // trust it once wpa_supplicant has moved the link to operstate "up" (4-way handshake completed).
-        boolean staLinkUp = !snap.usbIface.isEmpty()
+        boolean staLinkUp = snap.wpaSuppAlive && !snap.usbIface.isEmpty()
                 && "up".equals(readFirstLineQuick(new File("/sys/class/net/" + snap.usbIface + "/operstate")));
         if (!snap.staConnected && staLinkUp) {
             File[] apInfoFiles = new File[]{
@@ -540,6 +555,9 @@ public class UsbWifiStatusMain {
                 }
                 if (snap.staConnected) break;
             }
+        }
+        if (snap.staConnected && snap.staConnectedSsid.isEmpty() && !snap.staSsid.isEmpty()) {
+            snap.staConnectedSsid = snap.staSsid;
         }
         File wpaSigFile = new File(tmpDir, "wpa_signal.txt");
         if (wpaSigFile.isFile()) {
@@ -640,14 +658,14 @@ public class UsbWifiStatusMain {
             if (!dedup.isEmpty()) break;
         }
         snap.staScanList.addAll(dedup.values());
+        sortScanEntriesByRssi(snap.staScanList, snap.staConnected ? snap.staConnectedSsid : "");
         File savedStaFile = new File(installDir, "config/saved_sta.conf");
         if (savedStaFile.isFile()) {
             List<String> slines = readLinesQuick(savedStaFile, 20);
             for (String sl : slines) {
-                int eq = sl.indexOf('=');
-                String sName = (eq > 0 ? sl.substring(0, eq) : sl).trim();
-                if (!sName.isEmpty() && !snap.savedStaList.contains(sName)) {
-                    snap.savedStaList.add(sName);
+                String[] kv = parseSavedStaLine(sl);
+                if (kv != null && !kv[0].isEmpty() && !snap.savedStaList.contains(kv[0])) {
+                    snap.savedStaList.add(kv[0]);
                 }
             }
         }
@@ -702,15 +720,87 @@ public class UsbWifiStatusMain {
         return s;
     }
 
+    public static String selectBestRtwlanInterface(Map<String, Integer> ifIndices) {
+        if (ifIndices == null || ifIndices.isEmpty()) return "";
+        String bestIf = "";
+        int bestIdx = Integer.MIN_VALUE;
+        for (Map.Entry<String, Integer> entry : ifIndices.entrySet()) {
+            String name = entry.getKey();
+            if (name == null || !name.startsWith("rtwlan")) continue;
+            int idx = entry.getValue() != null ? entry.getValue().intValue() : -1;
+            if (bestIf.isEmpty() || idx > bestIdx) {
+                bestIdx = idx;
+                bestIf = name;
+            }
+        }
+        return bestIf;
+    }
+
+    public static void sortScanEntriesByRssi(List<ScanEntry> list, final String connectedSsid) {
+        if (list == null || list.size() <= 1) return;
+        Collections.sort(list, new Comparator<ScanEntry>() {
+            @Override
+            public int compare(ScanEntry a, ScanEntry b) {
+                boolean aCur = connectedSsid != null && !connectedSsid.isEmpty() && connectedSsid.equals(a.ssid);
+                boolean bCur = connectedSsid != null && !connectedSsid.isEmpty() && connectedSsid.equals(b.ssid);
+                if (aCur != bCur) return aCur ? -1 : 1;
+                if (a.rssi != b.rssi) return (b.rssi > a.rssi) ? 1 : -1;
+                boolean a5g = "5G".equals(a.band);
+                boolean b5g = "5G".equals(b.band);
+                if (a5g != b5g) return a5g ? -1 : 1;
+                return a.ssid.compareToIgnoreCase(b.ssid);
+            }
+        });
+    }
+
+    public static String[] parseSavedStaLine(String rawLine) {
+        if (rawLine == null) return null;
+        String line = rawLine;
+        while (line.endsWith("\r") || line.endsWith("\n")) {
+            line = line.substring(0, line.length() - 1);
+        }
+        if (line.trim().isEmpty()) return null;
+        int tab = line.indexOf('\t');
+        if (tab >= 0) {
+            String ssid = line.substring(0, tab).trim();
+            String pass = line.substring(tab + 1);
+            return ssid.isEmpty() ? null : new String[]{ssid, pass};
+        }
+        int eq = line.indexOf('=');
+        if (eq > 0) {
+            String ssid = line.substring(0, eq).trim();
+            String pass = line.substring(eq + 1);
+            return ssid.isEmpty() ? null : new String[]{ssid, pass};
+        }
+        String ssid = line.trim();
+        return ssid.isEmpty() ? null : new String[]{ssid, ""};
+    }
+
+    public static String formatSavedStaLine(String ssid, String pass) {
+        return (ssid == null ? "" : ssid) + "\t" + (pass == null ? "" : pass);
+    }
+
     public static String findUsbWifiInterface() {
         File netRoot = new File("/sys/class/net");
         File[] nets = netRoot.listFiles();
         if (nets == null) return "";
+        Map<String, Integer> rtwlanMap = new LinkedHashMap<String, Integer>();
+        for (File net : nets) {
+            String ifname = net.getName();
+            if (ifname.startsWith("rtwlan")) {
+                int idx = (int) parseLongSafe(readFirstLineQuick(new File(net, "ifindex")), -1L);
+                rtwlanMap.put(ifname, Integer.valueOf(idx));
+            }
+        }
+        String bestRtwlan = selectBestRtwlanInterface(rtwlanMap);
+        if (!bestRtwlan.isEmpty()) {
+            return bestRtwlan;
+        }
         for (File net : nets) {
             String ifname = net.getName();
             if (ifname.startsWith("lo") || ifname.startsWith("dummy") || ifname.startsWith("sit")
                     || ifname.startsWith("ip6tnl") || ifname.startsWith("rmnet")
-                    || ifname.equals("eth0") || ifname.startsWith("p2p") || ifname.equals("rtwlan1")) {
+                    || ifname.equals("eth0") || ifname.startsWith("p2p")) {
                 continue;
             }
             boolean isWireless = new File(net, "wireless").isDirectory() || new File(net, "phy80211").exists();
@@ -885,7 +975,15 @@ public class UsbWifiStatusMain {
         private static final Object[] staScanRowSubTvs = new Object[4];
         private static final Object[] staScanRowBandTvs = new Object[4];
         private static final String[] staScanRowSsids = new String[]{"", "", "", ""};
-        private static volatile Object staSavedListTv = null;
+        private static final boolean[] staScanRowSecured = new boolean[]{true, true, true, true};
+        private static volatile int staScanPage = 0;
+        private static volatile Object staScanPrevBtn = null;
+        private static volatile Object staScanPageTv = null;
+        private static volatile Object staScanNextBtn = null;
+        private static final Object[] staSavedRowViews = new Object[4];
+        private static final Object[] staSavedRowTitleTvs = new Object[4];
+        private static final Object[] staSavedRowDelBtns = new Object[4];
+        private static final String[] staSavedRowSsids = new String[]{"", "", "", ""};
         private static volatile Object staTrafficTv = null;
 
         // Expert Mode & OTA Update Views
@@ -910,6 +1008,7 @@ public class UsbWifiStatusMain {
         // Touch Keyboard Modal Views & State
         private static volatile boolean isEditModalOpen = false;
         private static volatile String modalContext = "ap"; // "ap" or "sta"
+        private static volatile boolean modalStaSecured = true;
         private static volatile String activeEditField = "ssid"; // "ssid" or "pass"
         private static volatile String editingSsid = "HKG_USB_Hotspot";
         private static volatile String editingPass = "12345678";
@@ -1664,6 +1763,7 @@ public class UsbWifiStatusMain {
             attachClickListener(rescanBtn, new Runnable() {
                 @Override
                 public void run() {
+                    staScanPage = 0;
                     triggerStaScanFromUi();
                 }
             });
@@ -1682,7 +1782,7 @@ public class UsbWifiStatusMain {
                     public void run() {
                         String targetSsid = staScanRowSsids[rowIdx];
                         if (targetSsid != null && !targetSsid.isEmpty()) {
-                            openStaConnectModalOnUi(targetSsid);
+                            openStaConnectModalOnUi(targetSsid, staScanRowSecured[rowIdx]);
                         } else {
                             openEditModalOnUi("sta_manual");
                         }
@@ -1712,6 +1812,54 @@ public class UsbWifiStatusMain {
                 addView.invoke(staCol2, sRow, sRowLp);
             }
 
+            Object staPageRow = llCtor.newInstance(sysContext);
+            setOrient.invoke(staPageRow, 0);
+            llSetGrav.invoke(staPageRow, 16);
+            staScanPrevBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staScanPrevBtn, "◀ 이전", 11.5f, 0xFFCBD5E1, true);
+            tvSetGravity.invoke(staScanPrevBtn, 17);
+            setPad.invoke(staScanPrevBtn, 12, 4, 12, 4);
+            setRoundedBg(staScanPrevBtn, 0xFF0F172A, 0xFF334155, 1, 8f);
+            attachClickListener(staScanPrevBtn, new Runnable() {
+                @Override
+                public void run() {
+                    if (staScanPage > 0) {
+                        staScanPage--;
+                        shownAtMs = System.currentTimeMillis();
+                        postToUi(REFRESH_TASK);
+                    }
+                }
+            });
+            addView.invoke(staPageRow, staScanPrevBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+
+            staScanPageTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staScanPageTv, "1 / 1 (0개)", 11.5f, 0xFF94A3B8, false);
+            tvSetGravity.invoke(staScanPageTv, 17);
+            addView.invoke(staPageRow, staScanPageTv, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+
+            staScanNextBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(staScanNextBtn, "다음 ▶", 11.5f, 0xFFCBD5E1, true);
+            tvSetGravity.invoke(staScanNextBtn, 17);
+            setPad.invoke(staScanNextBtn, 12, 4, 12, 4);
+            setRoundedBg(staScanNextBtn, 0xFF0F172A, 0xFF334155, 1, 8f);
+            attachClickListener(staScanNextBtn, new Runnable() {
+                @Override
+                public void run() {
+                    SystemSnapshot curSnap = latestSnapshot;
+                    int total = (curSnap != null) ? curSnap.staScanList.size() : 0;
+                    int maxPage = Math.max(0, (total - 1) / 4);
+                    if (staScanPage < maxPage) {
+                        staScanPage++;
+                        shownAtMs = System.currentTimeMillis();
+                        postToUi(REFRESH_TASK);
+                    }
+                }
+            });
+            addView.invoke(staPageRow, staScanNextBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            Object sprLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(sprLp, 0, 6, 0, 0);
+            addView.invoke(staCol2, staPageRow, sprLp);
+
             Object staCol2Lp = llLpCtor3.newInstance(0, MATCH_PARENT, 5.0f);
             setMargins(staCol2Lp, 8, 0, 8, 0);
             addView.invoke(staViewBox, staCol2, staCol2Lp);
@@ -1728,17 +1876,60 @@ public class UsbWifiStatusMain {
             setTextViewStyle(staCol3Title, "3. 저장된 Wi-Fi", 13.0f, 0xFF34D399, true);
             addView.invoke(staCol3Hdr, staCol3Title, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
             Object staAutoLbl = tvCtor.newInstance(sysContext);
-            setTextViewStyle(staAutoLbl, "자동 연결", 12.0f, 0xFF94A3B8, false);
+            setTextViewStyle(staAutoLbl, "터치 연결", 12.0f, 0xFF94A3B8, false);
             addView.invoke(staCol3Hdr, staAutoLbl, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
             addView.invoke(staCol3, staCol3Hdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
 
-            staSavedListTv = tvCtor.newInstance(sysContext);
-            setTextViewStyle(staSavedListTv, "저장된 네트워크 없음", 13.0f, 0xFFE2E8F0, false);
-            setPad.invoke(staSavedListTv, 12, 10, 12, 10);
-            setRoundedBg(staSavedListTv, 0xFF0F172A, 0xFF334155, 1, 12f);
-            Object sslLp = llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f);
-            setMargins(sslLp, 0, 10, 0, 10);
-            addView.invoke(staCol3, staSavedListTv, sslLp);
+            Object staSavedBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(staSavedBox, 1);
+            for (int i = 0; i < 4; i++) {
+                final int savedIdx = i;
+                Object svRow = llCtor.newInstance(sysContext);
+                setOrient.invoke(svRow, 0);
+                llSetGrav.invoke(svRow, 16);
+                setPad.invoke(svRow, 10, 5, 8, 5);
+                setRoundedBg(svRow, 0xFF0F172A, 0xFF334155, 1, 10f);
+
+                Object svTitleTv = tvCtor.newInstance(sysContext);
+                setTextViewStyle(svTitleTv, "저장된 Wi-Fi 없음", 12.5f, 0xFFE2E8F0, false);
+                attachClickListener(svTitleTv, new Runnable() {
+                    @Override
+                    public void run() {
+                        String targetSsid = staSavedRowSsids[savedIdx];
+                        if (targetSsid != null && !targetSsid.isEmpty()) {
+                            connectSavedStaFromUi(targetSsid);
+                        }
+                    }
+                });
+                addView.invoke(svRow, svTitleTv, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+
+                Object svDelBtn = tvCtor.newInstance(sysContext);
+                setTextViewStyle(svDelBtn, "✕", 12.0f, 0xFFFCA5A5, true);
+                tvSetGravity.invoke(svDelBtn, 17);
+                setPad.invoke(svDelBtn, 8, 3, 8, 3);
+                setRoundedBg(svDelBtn, 0x33E11D48, 0x66F43F5E, 1, 8f);
+                attachClickListener(svDelBtn, new Runnable() {
+                    @Override
+                    public void run() {
+                        String targetSsid = staSavedRowSsids[savedIdx];
+                        if (targetSsid != null && !targetSsid.isEmpty()) {
+                            removeSavedStaFromUi(targetSsid);
+                        }
+                    }
+                });
+                addView.invoke(svRow, svDelBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+
+                staSavedRowViews[i] = svRow;
+                staSavedRowTitleTvs[i] = svTitleTv;
+                staSavedRowDelBtns[i] = svDelBtn;
+
+                Object svLp = llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f);
+                setMargins(svLp, 0, 5, 0, 0);
+                addView.invoke(staSavedBox, svRow, svLp);
+            }
+            Object ssbLp = llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f);
+            setMargins(ssbLp, 0, 6, 0, 8);
+            addView.invoke(staCol3, staSavedBox, ssbLp);
 
             staTrafficTv = tvCtor.newInstance(sysContext);
             setTextViewStyle(staTrafficTv, "⬇ 수신 데이터 : 0 B\n⬆ 송신 데이터 : 0 B", 12.5f, 0xFF7DD3FC, true);
@@ -2412,38 +2603,77 @@ public class UsbWifiStatusMain {
                                     + "• 인터페이스 : " + (snap.usbIface.isEmpty() ? "rtwlan0" : snap.usbIface));
                 }
 
+                int totalScans = snap.staScanList.size();
+                int totalPages = Math.max(1, (totalScans + 3) / 4);
+                if (staScanPage >= totalPages) staScanPage = totalPages - 1;
+                if (staScanPage < 0) staScanPage = 0;
+                int pageOffset = staScanPage * 4;
                 for (int i = 0; i < 4; i++) {
-                    if (i < snap.staScanList.size()) {
-                        ScanEntry se = snap.staScanList.get(i);
+                    int idx = pageOffset + i;
+                    if (idx < totalScans) {
+                        ScanEntry se = snap.staScanList.get(idx);
                         staScanRowSsids[i] = se.ssid;
+                        staScanRowSecured[i] = se.secured;
                         boolean isCur = snap.staConnected && se.ssid.equals(snap.staConnectedSsid);
                         setText.invoke(staScanRowTitleTvs[i], "📶 " + se.ssid);
                         setText.invoke(staScanRowSubTvs[i], isCur
-                                ? "✔ 현재 연결됨 · 터치하여 비밀번호 수정"
+                                ? "✔ 현재 연결됨 (" + se.rssi + " dBm) · 터치하여 수정"
                                 : ("신호 (" + se.rssi + " dBm) · 터치하여 연결"));
                         setColor.invoke(staScanRowSubTvs[i], isCur ? 0xFF34D399 : 0xFF94A3B8);
-                        setText.invoke(staScanRowBandTvs[i], se.band + (se.secured ? " 🔒" : ""));
+                        setText.invoke(staScanRowBandTvs[i], se.band + (se.secured ? " 🔒" : " 🔓"));
                         setRoundedBg(staScanRowViews[i], isCur ? 0xFF064E3B : 0xFF0F172A, isCur ? 0xFF10B981 : 0xFF334155, 1, 10f);
                     } else {
                         staScanRowSsids[i] = "";
-                        setText.invoke(staScanRowTitleTvs[i], i == 0 ? "📶 주변 Wi-Fi 검색 결과 대기 중..." : "➕ 직접 Wi-Fi 이름(SSID) 입력하기");
-                        setText.invoke(staScanRowSubTvs[i], i == 0 ? "상단 [🔄 다시 검색]을 누르거나 터치하여 직접 입력" : "터치하여 화면 키보드로 연결");
+                        staScanRowSecured[i] = false;
+                        setText.invoke(staScanRowTitleTvs[i], (idx == 0) ? "📶 주변 Wi-Fi 검색 결과 대기 중..." : "➕ 직접 Wi-Fi 이름(SSID) 입력하기");
+                        setText.invoke(staScanRowSubTvs[i], (idx == 0) ? "상단 [🔄 다시 검색]을 누르거나 터치하여 직접 입력" : "터치하여 화면 키보드로 연결");
                         setColor.invoke(staScanRowSubTvs[i], 0xFF64748B);
                         setText.invoke(staScanRowBandTvs[i], "");
                         setRoundedBg(staScanRowViews[i], 0xFF0F172A, 0xFF1E293B, 1, 10f);
                     }
                 }
+                if (staScanPageTv != null) {
+                    setText.invoke(staScanPageTv, (staScanPage + 1) + " / " + totalPages + " (" + totalScans + "개)");
+                }
+                if (staScanPrevBtn != null) {
+                    boolean hasPrev = staScanPage > 0;
+                    setColor.invoke(staScanPrevBtn, hasPrev ? 0xFFFFFFFF : 0xFF475569);
+                    setRoundedBg(staScanPrevBtn, hasPrev ? 0xFF1E293B : 0xFF0F172A, hasPrev ? 0xFF475569 : 0xFF1E293B, 1, 8f);
+                }
+                if (staScanNextBtn != null) {
+                    boolean hasNext = (staScanPage + 1) < totalPages;
+                    setColor.invoke(staScanNextBtn, hasNext ? 0xFFFFFFFF : 0xFF475569);
+                    setRoundedBg(staScanNextBtn, hasNext ? 0xFF1E293B : 0xFF0F172A, hasNext ? 0xFF475569 : 0xFF1E293B, 1, 8f);
+                }
 
                 if (snap.savedStaList.isEmpty()) {
-                    setText.invoke(staSavedListTv, "저장된 Wi-Fi가 없습니다.\n\n한번 연결한 네트워크는 자동으로 기록됩니다.");
-                } else {
-                    StringBuilder ssb = new StringBuilder();
-                    int maxS = Math.min(4, snap.savedStaList.size());
-                    for (int i = 0; i < maxS; i++) {
-                        if (i > 0) ssb.append("\n\n");
-                        ssb.append(i + 1).append("순위: ").append(snap.savedStaList.get(i));
+                    staSavedRowSsids[0] = "";
+                    setVis.invoke(staSavedRowViews[0], 0);
+                    setText.invoke(staSavedRowTitleTvs[0], "저장된 Wi-Fi 없음 (연결 시 자동 저장)");
+                    setColor.invoke(staSavedRowTitleTvs[0], 0xFF64748B);
+                    setRoundedBg(staSavedRowViews[0], 0xFF0F172A, 0xFF1E293B, 1, 10f);
+                    setVis.invoke(staSavedRowDelBtns[0], 8);
+                    for (int i = 1; i < 4; i++) {
+                        staSavedRowSsids[i] = "";
+                        setVis.invoke(staSavedRowViews[i], 8);
                     }
-                    setText.invoke(staSavedListTv, ssb.toString());
+                } else {
+                    int maxS = Math.min(4, snap.savedStaList.size());
+                    for (int i = 0; i < 4; i++) {
+                        if (i < maxS) {
+                            String svSsid = snap.savedStaList.get(i);
+                            boolean isCur = snap.staConnected && svSsid.equals(snap.staConnectedSsid);
+                            staSavedRowSsids[i] = svSsid;
+                            setVis.invoke(staSavedRowViews[i], 0);
+                            setText.invoke(staSavedRowTitleTvs[i], (isCur ? "✔ " : (i + 1) + ". ") + svSsid);
+                            setColor.invoke(staSavedRowTitleTvs[i], isCur ? 0xFF6EE7B7 : 0xFFE2E8F0);
+                            setRoundedBg(staSavedRowViews[i], isCur ? 0xFF064E3B : 0xFF0F172A, isCur ? 0xFF10B981 : 0xFF334155, 1, 10f);
+                            setVis.invoke(staSavedRowDelBtns[i], 0);
+                        } else {
+                            staSavedRowSsids[i] = "";
+                            setVis.invoke(staSavedRowViews[i], 8);
+                        }
+                    }
                 }
                 setText.invoke(staTrafficTv, "⬇ 수신 데이터 : " + formatBytes(snap.rxBytes) + "\n⬆ 송신 데이터 : " + formatBytes(snap.txBytes));
 
@@ -2505,11 +2735,13 @@ public class UsbWifiStatusMain {
             SystemSnapshot snap = latestSnapshot;
             if ("sta_manual".equals(target)) {
                 modalContext = "sta";
+                modalStaSecured = false;
                 editingSsid = (snap != null && !snap.staSsid.isEmpty()) ? snap.staSsid : "";
                 editingPass = (snap != null && !snap.staPass.isEmpty()) ? snap.staPass : "";
                 activeEditField = "ssid";
             } else {
                 modalContext = "ap";
+                modalStaSecured = true;
                 editingSsid = (snap != null && !snap.apSsid.isEmpty()) ? snap.apSsid : "HKG_USB_Hotspot";
                 editingPass = (snap != null && !snap.apPass.isEmpty()) ? snap.apPass : "12345678";
                 activeEditField = "ap_pass".equals(target) ? "pass" : "ssid";
@@ -2519,9 +2751,10 @@ public class UsbWifiStatusMain {
             postToUi(REFRESH_TASK);
         }
 
-        private static void openStaConnectModalOnUi(String targetSsid) {
+        private static void openStaConnectModalOnUi(String targetSsid, boolean secured) {
             SystemSnapshot snap = latestSnapshot;
             modalContext = "sta";
+            modalStaSecured = secured;
             editingSsid = targetSsid;
             editingPass = (snap != null && targetSsid.equals(snap.staSsid) && !snap.staPass.isEmpty())
                     ? snap.staPass
@@ -2538,12 +2771,8 @@ public class UsbWifiStatusMain {
             if (!savedFile.isFile()) return "";
             List<String> lines = readLinesQuick(savedFile, 30);
             for (String l : lines) {
-                int eq = l.indexOf('=');
-                if (eq > 0) {
-                    String k = l.substring(0, eq).trim();
-                    String v = l.substring(eq + 1).trim();
-                    if (ssid.equals(k)) return v;
-                }
+                String[] kv = parseSavedStaLine(l);
+                if (kv != null && ssid.equals(kv[0])) return kv[1];
             }
             return "";
         }
@@ -2553,12 +2782,11 @@ public class UsbWifiStatusMain {
                 File savedFile = new File(installDir, "config/saved_sta.conf");
                 List<String> existing = savedFile.isFile() ? readLinesQuick(savedFile, 30) : new ArrayList<String>();
                 List<String> updated = new ArrayList<String>();
-                updated.add(ssid + "=" + pass);
+                updated.add(formatSavedStaLine(ssid, pass));
                 for (String l : existing) {
-                    int eq = l.indexOf('=');
-                    String k = (eq > 0 ? l.substring(0, eq) : l).trim();
-                    if (!k.isEmpty() && !k.equals(ssid) && updated.size() < 8) {
-                        updated.add(l.trim());
+                    String[] kv = parseSavedStaLine(l);
+                    if (kv != null && !kv[0].isEmpty() && !kv[0].equals(ssid) && updated.size() < 8) {
+                        updated.add(formatSavedStaLine(kv[0], kv[1]));
                     }
                 }
                 StringBuilder sb = new StringBuilder();
@@ -2568,6 +2796,72 @@ public class UsbWifiStatusMain {
                 writeBytesAtomic(savedFile, sb.toString().getBytes(UTF8));
             } catch (Throwable ignored) {
             }
+        }
+
+        private static void connectSavedStaFromUi(final String targetSsid) {
+            final String savedPass = lookupSavedStaPassword(targetSsid);
+            actionBannerMsg = "📶 저장된 Wi-Fi [" + targetSsid + "]에 연결을 요청하고 있습니다...";
+            postToUi(REFRESH_TASK);
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        new File(TMP_DIR_PATH, "sta_paused").delete();
+                        File confFile = new File(installDir, "config/hotspot.conf");
+                        updateConfigKeys(confFile, new String[][]{
+                                {"WIFI_MODE", "sta"},
+                                {"STA_SSID", targetSsid},
+                                {"STA_PASS", savedPass}
+                        });
+                        saveStaNetworkToHistory(targetSsid, savedPass);
+                        writeBytesAtomic(new File(TMP_DIR_PATH, "force_restart"), "1\n".getBytes(UTF8));
+                        latestSnapshot = collectSnapshot(installDir);
+                    } catch (Throwable t) {
+                        actionBannerMsg = "⚠️ 저장된 Wi-Fi 연결 실패: " + t.getMessage();
+                    }
+                    postToUi(REFRESH_TASK);
+                }
+            }, "ConnectSavedStaThread").start();
+        }
+
+        private static void removeSavedStaFromUi(final String targetSsid) {
+            actionBannerMsg = "🗑 저장된 Wi-Fi [" + targetSsid + "]을(를) 목록에서 삭제하고 있습니다...";
+            postToUi(REFRESH_TASK);
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        File savedFile = new File(installDir, "config/saved_sta.conf");
+                        List<String> existing = savedFile.isFile() ? readLinesQuick(savedFile, 30) : new ArrayList<String>();
+                        List<String> kept = new ArrayList<String>();
+                        for (String l : existing) {
+                            String[] kv = parseSavedStaLine(l);
+                            if (kv != null && !kv[0].isEmpty() && !kv[0].equals(targetSsid)) {
+                                kept.add(formatSavedStaLine(kv[0], kv[1]));
+                            }
+                        }
+                        StringBuilder sb = new StringBuilder();
+                        for (String k : kept) {
+                            sb.append(k).append('\n');
+                        }
+                        writeBytesAtomic(savedFile, sb.toString().getBytes(UTF8));
+                        File confFile = new File(installDir, "config/hotspot.conf");
+                        Map<String, String> conf = parseKeyValueFile(confFile);
+                        if (targetSsid.equals(getOrDefault(conf, "STA_SSID", ""))) {
+                            updateConfigKeys(confFile, new String[][]{
+                                    {"STA_SSID", ""},
+                                    {"STA_PASS", ""}
+                            });
+                            writeBytesAtomic(new File(TMP_DIR_PATH, "disconnect_sta"), "1\n".getBytes(UTF8));
+                        }
+                        latestSnapshot = collectSnapshot(installDir);
+                        actionBannerMsg = "✅ 저장된 Wi-Fi [" + targetSsid + "]을(를) 삭제했습니다.";
+                    } catch (Throwable t) {
+                        actionBannerMsg = "⚠️ 저장된 Wi-Fi 삭제 실패: " + t.getMessage();
+                    }
+                    postToUi(REFRESH_TASK);
+                }
+            }, "RemoveSavedStaThread").start();
         }
 
         private static void refreshKeyboardCaseOnUi() {
@@ -2634,20 +2928,33 @@ public class UsbWifiStatusMain {
 
                 String sTrim = editingSsid.trim();
                 boolean ssidOk = sTrim.length() >= 1 && sTrim.length() <= 32;
-                boolean passOk = editingPass.length() >= 8 && editingPass.length() <= 63;
+                boolean passOk = isSta
+                        ? (editingPass.isEmpty() || (editingPass.length() >= 8 && editingPass.length() <= 63))
+                        : (editingPass.length() >= 8 && editingPass.length() <= 63);
 
                 setText.invoke(modalSsidValueTv, editingSsid.isEmpty() ? "(이름을 입력하세요)" : editingSsid);
                 setColor.invoke(modalSsidValueTv, editingSsid.isEmpty() ? 0xFF64748B : 0xFFFFFFFF);
                 setText.invoke(modalSsidLenTv, sTrim.length() + " / 32자");
 
-                setText.invoke(modalPassValueTv, editingPass.isEmpty() ? "(비밀번호 8자 이상)" : editingPass);
-                setColor.invoke(modalPassValueTv, editingPass.isEmpty() ? 0xFF64748B : 0xFFFCD34D);
-                if (passOk) {
-                    setText.invoke(modalPassLenTv, "✔ " + editingPass.length() + "자 가능");
+                if (isSta && editingPass.isEmpty()) {
+                    setText.invoke(modalPassValueTv, "(비밀번호 없음 — 개방형 Wi-Fi)");
+                    setColor.invoke(modalPassValueTv, 0xFF94A3B8);
+                    setText.invoke(modalPassLenTv, modalStaSecured
+                            ? "✔ 개방형(비번 없음) / 보안 AP는 8자+"
+                            : "✔ 개방형 (비밀번호 없음)");
                     setColor.invoke(modalPassLenTv, 0xFF34D399);
                 } else {
-                    setText.invoke(modalPassLenTv, "⚠ " + editingPass.length() + "자 (8자 이상)");
-                    setColor.invoke(modalPassLenTv, 0xFFFDA4AF);
+                    setText.invoke(modalPassValueTv, editingPass.isEmpty() ? "(비밀번호 8자 이상)" : editingPass);
+                    setColor.invoke(modalPassValueTv, editingPass.isEmpty() ? 0xFF64748B : 0xFFFCD34D);
+                    if (passOk) {
+                        setText.invoke(modalPassLenTv, "✔ " + editingPass.length() + "자 가능");
+                        setColor.invoke(modalPassLenTv, 0xFF34D399);
+                    } else {
+                        setText.invoke(modalPassLenTv, isSta
+                                ? ("⚠ " + editingPass.length() + "자 (비우거나 8자 이상)")
+                                : ("⚠ " + editingPass.length() + "자 (8자 이상)"));
+                        setColor.invoke(modalPassLenTv, 0xFFFDA4AF);
+                    }
                 }
 
                 if (ssidOk && passOk) {
@@ -2659,7 +2966,9 @@ public class UsbWifiStatusMain {
                 } else {
                     setText.invoke(modalValidationTv, !ssidOk
                             ? "  ⚠ 와이파이 이름(SSID)을 1자 이상 입력해 주세요"
-                            : "  ⚠ 비밀번호는 8자리 이상 입력해야 합니다");
+                            : (isSta
+                                ? "  ⚠ 비밀번호를 비우거나(개방형) 8자리 이상 입력해 주세요"
+                                : "  ⚠ 비밀번호는 8자리 이상 입력해야 합니다"));
                     setColor.invoke(modalValidationTv, 0xFFFDA4AF);
                     setRoundedBg(modalSaveBtn, 0xFF334155, 0xFF475569, 1, 10f);
                 }
@@ -2668,9 +2977,13 @@ public class UsbWifiStatusMain {
         }
 
         private static void saveModalAndApplyOnUi() {
+            final boolean isSta = "sta".equals(modalContext);
             final String newSsid = editingSsid.trim();
             final String newPass = editingPass;
-            if (newSsid.length() < 1 || newSsid.length() > 32 || newPass.length() < 8 || newPass.length() > 63) {
+            boolean passValid = isSta
+                    ? (newPass.isEmpty() || (newPass.length() >= 8 && newPass.length() <= 63))
+                    : (newPass.length() >= 8 && newPass.length() <= 63);
+            if (newSsid.length() < 1 || newSsid.length() > 32 || !passValid) {
                 return;
             }
             if (!isSafeConfigValue(newSsid) || !isSafeConfigValue(newPass)) {
@@ -2678,7 +2991,6 @@ public class UsbWifiStatusMain {
                 postToUi(REFRESH_TASK);
                 return;
             }
-            final boolean isSta = "sta".equals(modalContext);
             isEditModalOpen = false;
             actionBannerMsg = isSta
                     ? ("📶 외부 Wi-Fi [" + newSsid + "]에 연결을 요청하고 있습니다...")
@@ -2691,6 +3003,7 @@ public class UsbWifiStatusMain {
                     try {
                         File confFile = new File(installDir, "config/hotspot.conf");
                         if (isSta) {
+                            new File(TMP_DIR_PATH, "sta_paused").delete();
                             updateConfigKeys(confFile, new String[][]{
                                     {"WIFI_MODE", "sta"},
                                     {"STA_SSID", newSsid},
@@ -2724,6 +3037,9 @@ public class UsbWifiStatusMain {
                 @Override
                 public void run() {
                     try {
+                        if ("sta".equals(targetMode)) {
+                            new File(TMP_DIR_PATH, "sta_paused").delete();
+                        }
                         File confFile = new File(installDir, "config/hotspot.conf");
                         updateConfigKeys(confFile, new String[][]{
                                 {"WIFI_MODE", targetMode}
@@ -2792,6 +3108,7 @@ public class UsbWifiStatusMain {
                                 {"STA_SSID", ""},
                                 {"STA_PASS", ""}
                         });
+                        writeBytesAtomic(new File(TMP_DIR_PATH, "sta_paused"), "1\n".getBytes(UTF8));
                         writeBytesAtomic(new File(TMP_DIR_PATH, "disconnect_sta"), "1\n".getBytes(UTF8));
                         Thread.sleep(1000L);
                         latestSnapshot = collectSnapshot(installDir);
@@ -3285,7 +3602,10 @@ public class UsbWifiStatusMain {
             int eq = t.indexOf('=');
             if (eq > 0) {
                 String k = t.substring(0, eq).trim();
-                String v = stripQuotes(t.substring(eq + 1).trim());
+                String rawVal = t.substring(eq + 1);
+                boolean preserveRaw = "AP_SSID".equals(k) || "AP_PASS".equals(k)
+                        || "STA_SSID".equals(k) || "STA_PASS".equals(k);
+                String v = preserveRaw ? rawVal : stripQuotes(rawVal.trim());
                 map.put(k, v);
             }
         }
@@ -3594,6 +3914,110 @@ public class UsbWifiStatusMain {
         return num.length() > 0 ? parseLongSafe(num.toString(), def) : def;
     }
 
+    private static final AtomicInteger sWpaCtrlSeq = new AtomicInteger(0);
+
+    /** Sends a single command to wpa_supplicant's UNIX datagram control socket without wpa_cli. */
+    public static String wpaCtrlCommand(String iface, String command, int timeoutMs) {
+        if (iface == null || iface.isEmpty() || command == null || command.isEmpty()) return null;
+        File serverSock = new File(WIFI_WORK_DIR_PATH + "/wpa_ctrl/" + iface);
+        if (!serverSock.exists()) return null;
+        String clientPath = WIFI_WORK_DIR_PATH + "/wpa_ctrl/cli_" + Thread.currentThread().getId()
+                + "_" + sWpaCtrlSeq.incrementAndGet() + ".sock";
+        File clientFile = new File(clientPath);
+        if (clientFile.exists()) {
+            clientFile.delete();
+        }
+        Object sock = null;
+        Method mClose = null;
+        try {
+            Class<?> lsCls = Class.forName("android.net.LocalSocket");
+            Class<?> lsaCls = Class.forName("android.net.LocalSocketAddress");
+            Class<?> nsCls = Class.forName("android.net.LocalSocketAddress$Namespace");
+            int dgramType = lsCls.getField("SOCKET_DGRAM").getInt(null);
+            Object nsFs = nsCls.getField("FILESYSTEM").get(null);
+            Constructor<?> lsCtor = lsCls.getConstructor(int.class);
+            Constructor<?> lsaCtor = lsaCls.getConstructor(String.class, nsCls);
+
+            sock = lsCtor.newInstance(dgramType);
+            mClose = lsCls.getMethod("close");
+            Method mBind = lsCls.getMethod("bind", lsaCls);
+            Method mConnect = lsCls.getMethod("connect", lsaCls);
+            Method mSetTimeout = lsCls.getMethod("setSoTimeout", int.class);
+            Method mGetOut = lsCls.getMethod("getOutputStream");
+            Method mGetIn = lsCls.getMethod("getInputStream");
+
+            mBind.invoke(sock, lsaCtor.newInstance(clientPath, nsFs));
+            // Allow wpa_supplicant (uid=1010) to reply to our bound root-owned socket
+            clientFile.setReadable(true, false);
+            clientFile.setWritable(true, false);
+
+            mConnect.invoke(sock, lsaCtor.newInstance(serverSock.getAbsolutePath(), nsFs));
+            mSetTimeout.invoke(sock, timeoutMs);
+
+            OutputStream out = (OutputStream) mGetOut.invoke(sock);
+            out.write(command.getBytes(UTF8));
+            out.flush();
+
+            InputStream in = (InputStream) mGetIn.invoke(sock);
+            byte[] buf = new byte[16384];
+            int n = in.read(buf);
+            if (n > 0) {
+                return new String(buf, 0, n, UTF8);
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (sock != null && mClose != null) {
+                try { mClose.invoke(sock); } catch (Throwable ignored) {}
+            }
+            if (clientFile.exists()) {
+                clientFile.delete();
+            }
+        }
+        return null;
+    }
+
+    /** Executes high-level wpa_ctrl actions (KICK_CONNECT, SCAN, POLL, or raw command). */
+    public static boolean handleWpaCtrlRequest(String iface, String action) {
+        if (iface == null || iface.isEmpty() || action == null || action.isEmpty()) return false;
+        if ("KICK_CONNECT".equals(action)) {
+            wpaCtrlCommand(iface, "ENABLE_NETWORK all", 1500);
+            String rec = wpaCtrlCommand(iface, "RECONNECT", 1500);
+            if (rec != null && rec.trim().startsWith("OK")) {
+                wpaCtrlCommand(iface, "SCAN", 1500);
+                return true;
+            }
+            return false;
+        }
+        if ("SCAN".equals(action)) {
+            String r = wpaCtrlCommand(iface, "SCAN", 1500);
+            return r != null && (r.trim().startsWith("OK") || r.contains("FAIL-BUSY"));
+        }
+        if ("POLL".equals(action)) {
+            boolean statusOk = false;
+            String st = wpaCtrlCommand(iface, "STATUS", 800);
+            if (st != null && st.contains("wpa_state=")) {
+                statusOk = true;
+                try { writeBytesAtomic(new File(TMP_DIR_PATH, "wpa_status.txt"), st.getBytes(UTF8)); } catch (Throwable ignored) {}
+            }
+            String sig = wpaCtrlCommand(iface, "SIGNAL_POLL", 800);
+            if (sig != null && sig.contains("RSSI=")) {
+                try { writeBytesAtomic(new File(TMP_DIR_PATH, "wpa_signal.txt"), sig.getBytes(UTF8)); } catch (Throwable ignored) {}
+            }
+            String sr = wpaCtrlCommand(iface, "SCAN_RESULTS", 1200);
+            if (sr != null && sr.contains("bssid")) {
+                try { writeBytesAtomic(new File(TMP_DIR_PATH, "sta_scan.txt"), sr.getBytes(UTF8)); } catch (Throwable ignored) {}
+            }
+            return statusOk;
+        }
+        String res = wpaCtrlCommand(iface, action, 1500);
+        if (res != null) {
+            System.out.print(res);
+            if (!res.endsWith("\n")) System.out.println();
+            return true;
+        }
+        return false;
+    }
+
     private static FileOutputStream sLockFos = null;
     private static java.nio.channels.FileLock sInstanceLock = null;
 
@@ -3643,12 +4067,29 @@ public class UsbWifiStatusMain {
 
         File modeswitchFile = new File(tmpDir, "trigger_modeswitch");
         File modeswitchDoneFile = new File(tmpDir, "modeswitch_done");
+        File wpaCtrlReqFile = new File(tmpDir, "wpa_ctrl_req");
+        File wpaCtrlDoneFile = new File(tmpDir, "wpa_ctrl_done");
         while (true) {
             if (modeswitchFile.exists()) {
                 modeswitchFile.delete();
                 int msRc = modeswitchRealtekCdrom();
                 try {
                     writeBytesAtomic(modeswitchDoneFile, (msRc + "\n").getBytes(UTF8));
+                } catch (Throwable ignored) {
+                }
+            }
+            if (wpaCtrlReqFile.exists()) {
+                String reqLine = readFirstLineQuick(wpaCtrlReqFile).trim();
+                wpaCtrlReqFile.delete();
+                int wpaRc = 1;
+                int sp = reqLine.indexOf(' ');
+                if (sp > 0 && sp + 1 < reqLine.length()) {
+                    String reqIface = reqLine.substring(0, sp).trim();
+                    String reqAct = reqLine.substring(sp + 1).trim();
+                    wpaRc = handleWpaCtrlRequest(reqIface, reqAct) ? 0 : 1;
+                }
+                try {
+                    writeBytesAtomic(wpaCtrlDoneFile, (wpaRc + "\n").getBytes(UTF8));
                 } catch (Throwable ignored) {
                 }
             }
@@ -5076,7 +5517,63 @@ public class UsbWifiStatusMain {
             throw new AssertionError("buildScsiCbw failed");
         }
 
-        System.out.println("USBWIFI STATUS UI SELF-TEST PASSED! (" + compact + ", mapHoldTests=OK, rtl8831buTests=OK, modeswitchTests=OK)");
+        // 7) Client (STA) interface selection, RSSI sorting, saved_sta & config parsing tests
+        Map<String, Integer> ifMap1 = new LinkedHashMap<String, Integer>();
+        ifMap1.put("rtwlan0", Integer.valueOf(10));
+        if (!"rtwlan0".equals(selectBestRtwlanInterface(ifMap1))) {
+            throw new AssertionError("selectBestRtwlanInterface single failed");
+        }
+        Map<String, Integer> ifMap2 = new LinkedHashMap<String, Integer>();
+        ifMap2.put("rtwlan0", Integer.valueOf(11));
+        ifMap2.put("rtwlan1", Integer.valueOf(12));
+        if (!"rtwlan1".equals(selectBestRtwlanInterface(ifMap2))) {
+            throw new AssertionError("selectBestRtwlanInterface dual failed");
+        }
+
+        List<ScanEntry> sortList = new ArrayList<ScanEntry>();
+        ScanEntry sLow = new ScanEntry(); sLow.ssid = "neighbor_24"; sLow.band = "2.4G"; sLow.rssi = -86;
+        ScanEntry sMid = new ScanEntry(); sMid.ssid = "mid_5g"; sMid.band = "5G"; sMid.rssi = -59;
+        ScanEntry sStrong = new ScanEntry(); sStrong.ssid = "grttt"; sStrong.band = "5G"; sStrong.rssi = -31;
+        ScanEntry sCur = new ScanEntry(); sCur.ssid = "current_ap"; sCur.band = "2.4G"; sCur.rssi = -65;
+        sortList.add(sLow);
+        sortList.add(sMid);
+        sortList.add(sStrong);
+        sortList.add(sCur);
+        sortScanEntriesByRssi(sortList, "current_ap");
+        if (!"current_ap".equals(sortList.get(0).ssid) || !"grttt".equals(sortList.get(1).ssid)
+                || !"mid_5g".equals(sortList.get(2).ssid) || !"neighbor_24".equals(sortList.get(3).ssid)) {
+            throw new AssertionError("sortScanEntriesByRssi failed");
+        }
+
+        String savedFmtEq = formatSavedStaLine("SSID=with=equals", "\"p@ss word\"");
+        String[] savedParsedEq = parseSavedStaLine(savedFmtEq);
+        if (savedParsedEq == null || !"SSID=with=equals".equals(savedParsedEq[0])
+                || !"\"p@ss word\"".equals(savedParsedEq[1])) {
+            throw new AssertionError("parseSavedStaLine tab/equals/quotes failed");
+        }
+        String[] savedOpen = parseSavedStaLine(formatSavedStaLine("Free_Cafe_WiFi", ""));
+        if (savedOpen == null || !"Free_Cafe_WiFi".equals(savedOpen[0]) || !"".equals(savedOpen[1])) {
+            throw new AssertionError("parseSavedStaLine open Wi-Fi failed");
+        }
+        String[] savedLegacy = parseSavedStaLine("LegacyHome=secret123");
+        if (savedLegacy == null || !"LegacyHome".equals(savedLegacy[0]) || !"secret123".equals(savedLegacy[1])) {
+            throw new AssertionError("parseSavedStaLine legacy '=' failed");
+        }
+
+        File tmpKv = File.createTempFile("usbwifi_kv_", ".conf");
+        try {
+            writeBytesAtomic(tmpKv, ("STA_SSID=\"My=Hotspot\"\nSTA_PASS='keep\"quotes'\nMODULE_ARGS=\"a b\"\n").getBytes(UTF8));
+            Map<String, String> kvParsed = parseKeyValueFile(tmpKv);
+            if (!"\"My=Hotspot\"".equals(kvParsed.get("STA_SSID"))
+                    || !"'keep\"quotes'".equals(kvParsed.get("STA_PASS"))
+                    || !"a b".equals(kvParsed.get("MODULE_ARGS"))) {
+                throw new AssertionError("parseKeyValueFile raw SSID/PASS preservation failed");
+            }
+        } finally {
+            tmpKv.delete();
+        }
+
+        System.out.println("USBWIFI STATUS UI SELF-TEST PASSED! (" + compact + ", mapHoldTests=OK, rtl8831buTests=OK, modeswitchTests=OK, staTests=OK)");
         return 0;
     }
 
@@ -5091,12 +5588,14 @@ public class UsbWifiStatusMain {
             writeBytesAtomic(new File(tmpDir, "show_ui"), "1".getBytes(UTF8));
         } else if ("modeswitch".equals(args[0])) {
             System.exit(modeswitchRealtekCdrom());
+        } else if ("wpa-ctrl".equals(args[0]) && args.length >= 3) {
+            System.exit(handleWpaCtrlRequest(args[1], args[2]) ? 0 : 1);
         } else if ("patch-hostapd".equals(args[0]) && args.length >= 3) {
             patchHostapdBinary(new File(args[1]), new File(args[2]));
         } else if ("test-self".equals(args[0])) {
             System.exit(runSelfTest());
         } else {
-            System.err.println("Usage: UsbWifiStatusMain [daemon|show-ui|modeswitch|patch-hostapd|test-self]");
+            System.err.println("Usage: UsbWifiStatusMain [daemon|show-ui|modeswitch|wpa-ctrl|patch-hostapd|test-self]");
             System.exit(2);
         }
     }

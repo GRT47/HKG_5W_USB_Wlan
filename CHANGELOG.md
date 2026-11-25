@@ -5,6 +5,23 @@ HKG Gen5W USB Wi-Fi Hotspot (AP) & Client (STA) Enabler의 버전별 변경 사�
 
 ---
 
+## v2.0.10 — 2026-11-26
+
+### 수정 (클라이언트 / STA 모드)
+- **8851BU/듀얼 인터페이스(`rtwlan1`) UI 미표시 수정**: 대시보드가 `rtwlan1`을 제외하고 `rtwlan0`만 읽던 문제를 수정해, 데몬과 동일하게 실제 활성 `rtwlan*` 인터페이스를 조회하도록 통일했습니다. 이제 연결 상태·IP·신호 세기·데이터 사용량이 정상 표시됩니다.
+- **`wpa_supplicant` 제어 소켓 직접 연동 (`LocalSocket SOCKET_DGRAM`)**: `wpa_cli`가 없는 헤드유닛에서도 UI 프로세스가 `/data/misc/wifi/usbwifi_hotspot/wpa_ctrl` 소켓에 직접 `RECONNECT`/`SCAN`/`STATUS`/`SIGNAL_POLL`/`SCAN_RESULTS` 명령을 보내도록 구현해 `SIGHUP` 방식의 불확실성과 `survey_info` 스캔 경합을 해소했습니다(불가 시 기존 `SIGHUP` 폴백 유지).
+- **Wi-Fi 끊김/로밍 시 LTE 블랙홀 및 재연결 불가 수정**: 외부 Wi-Fi 연결이 끊기거나 다른 AP로 로밍할 때 `table 62`·`9800` 정책 라우팅·이전 DHCP IP·`ndc` 기본 DNS가 남아 순정 LTE(블루링크/기아커넥트/OTA)가 먹통 되거나 새 AP에서 DHCP를 못 받던 문제를 수정했습니다.
+- **순정 `wlan0`(무선 카플레이/안드로이드 오토) 및 `rmnet` 충돌 방지 / 정확한 서브넷 CIDR 반영**: `pref 9780`(순정 `wlan0` 대역)·`pref 9785/9786`(`rmnet0/rmnet1` 소스 IP) 예외 규칙을 `9800`보다 먼저 적용하고, `/24` 고정 대신 커널 라우팅의 실제 프리픽스(예: iPhone 핫스팟 `/28` 등)를 사용합니다.
+- **신호 세기(`staRssi`) `-50 dBm` 고정 버그 및 종료 시 연결 오탐 수정**: 초기값을 `-- dBm`으로 고쳐 `SIGNAL_POLL` / `rx_signal` 실측값이 정상 반영되게 하고, `wpa_supplicant`가 살아 있을 때만 `operstate=up`을 연결됨으로 판단합니다.
+- **개방형(비밀번호 없는) Wi-Fi 및 특수문자 SSID/비밀번호 지원**: STA 모달에서 비밀번호 공란(개방형) 연결과 `saved_sta.conf` 저장을 허용하고, `"`·`\`·`=`·공백이 들어간 SSID/비밀번호가 훼손되지 않도록 이스케이프 및 탭 구분 포맷을 적용했습니다.
+- **제거 스크립트(`preun.sh`) 및 규제 도메인 보완**: `wpa_supplicant.conf`에 `country=KR`을 추가하고, 제거 시 `rtwlan1` 규칙·STA 정책 라우팅·LTE 기본 DNS까지 깔끔히 원복합니다.
+
+### 개선 (클라이언트 UI)
+- **주변 Wi-Fi 목록 신호 세기순 정렬 및 페이지 이동**: 연결 중인 AP → 강한 신호(RSSI) 순으로 정렬하고 `◀ 이전` / `다음 ▶` 페이지 버튼을 추가해 주변에 Wi-Fi가 많아도 5GHz 핫스팟이 4개 제한에 가려지지 않습니다.
+- **저장된 Wi-Fi 터치 재연결 및 삭제**: 3번 패널의 저장된 Wi-Fi를 터치해 바로 연결하거나 `✕` 버튼으로 삭제할 수 있으며, `STA_SSID`가 비어 있을 때도 저장된 네트워크 자동 연결이 동작합니다(수동 연결 해제 시에는 자동 재연결 일시 정지).
+
+---
+
 ## v2.0.9 — 2026-11-18
 
 ### 수정

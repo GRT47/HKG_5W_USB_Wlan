@@ -1,9 +1,9 @@
 {
-  "version": "2.0.9",
+  "version": "2.0.10",
   "repo": "GRT47/HKG_5W_USB_Wlan",
   "branch": "main",
-  "sha256_jar": "247ec56208cb7f0d34eebaf61584bac3a28da988bb42e83e88ad6f4f3c38713e",
-  "sha256_daemon": "69dd1b65fe9eccffd2763d35ac76e05ce59ac89fb271b196263aec10929b567d",
+  "sha256_jar": "1de32ce39e715f77076ea0a2fe83022b9740a1e1c37813220d3c4a266113510f",
+  "sha256_daemon": "0ce3f840cb99437ff7e60e549b6cd22d184b9786e27c4e7d30a8526232364692",
   "sha256_launch": "f178706c82d54480db7ed44041ffeaa2e9ea3e958ac1600dc850a4d385c4f9f4",
-  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.9: Fix RTL8851BU/8831BU 0bda:1a2b CD-ROM stuck on cold boot via BOT StandardEject, CSW read, pre-boot modeswitch & USB authorized recovery)"
+  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.10: Fix STA rtwlan1 UI detection, wpa_ctrl socket scan/reconnect, disconnect/roaming LTE DNS/route recovery, wlan0/rmnet policy rules, RSSI-sorted paginated scan list, open Wi-Fi & interactive saved networks)"
 }
