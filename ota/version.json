@@ -2,8 +2,9 @@
   "version": "2.0.10",
   "repo": "GRT47/HKG_5W_USB_Wlan",
   "branch": "main",
-  "sha256_jar": "1de32ce39e715f77076ea0a2fe83022b9740a1e1c37813220d3c4a266113510f",
+  "sha256_jar": "5b9522039f07f160866d64eb5d183ce9ea3c692d683cf30211754667f86d9da2",
   "sha256_daemon": "0ce3f840cb99437ff7e60e549b6cd22d184b9786e27c4e7d30a8526232364692",
   "sha256_launch": "f178706c82d54480db7ed44041ffeaa2e9ea3e958ac1600dc850a4d385c4f9f4",
-  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.10: Fix STA rtwlan1 UI detection, wpa_ctrl socket scan/reconnect, disconnect/roaming LTE DNS/route recovery, wlan0/rmnet policy rules, RSSI-sorted paginated scan list, open Wi-Fi & interactive saved networks)"
+  "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.10: Fix STA rtwlan1 UI detection, wpa_ctrl socket scan/reconnect, disconnect/roaming LTE recovery, wlan0/rmnet policy rules, RSSI-sorted paginated scan list, open Wi-Fi, interactive saved networks & post-update What's New popup)",
+  "release_notes": "• 8851BU/듀얼 인터페이스(rtwlan1) 클라이언트 대시보드 표시 오류 수정\n• wpa_supplicant 제어 소켓 직접 연동으로 Wi-Fi 검색·연결 안정화\n• Wi-Fi 끊김·로밍 시 순정 LTE(블루링크/OTA) 먹통 방지 및 DNS 자동 복구\n• 순정 무선 카플레이/AA(wlan0)·LTE 충돌 방지 및 iPhone 등 서브넷 자동 대응\n• 주변 Wi-Fi 신호 세기순 정렬·페이지 이동, 개방형(비번 없음) 및 저장 Wi-Fi 터치 연결 지원\n• OTA 업데이트 후 변경 내역 안내 팝업 추가 (상세 정보 화면에서 언제든 다시 보기 가능)"
 }

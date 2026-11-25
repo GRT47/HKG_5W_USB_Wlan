@@ -2008,11 +2008,21 @@ def build() -> None:
             "sha256_jar": sha256_jar,
             "sha256_daemon": sha256_daemon,
             "sha256_launch": sha256_launch,
-            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.10: Fix STA rtwlan1 UI detection, wpa_ctrl socket scan/reconnect, disconnect/roaming LTE DNS/route recovery, wlan0/rmnet policy rules, RSSI-sorted paginated scan list, open Wi-Fi & interactive saved networks)",
+            "description": "HKG Gen5W USB Wi-Fi Hotspot & Client Dual Mode (v2.0.10: Fix STA rtwlan1 UI detection, wpa_ctrl socket scan/reconnect, disconnect/roaming LTE recovery, wlan0/rmnet policy rules, RSSI-sorted paginated scan list, open Wi-Fi, interactive saved networks & post-update What's New popup)",
+            "release_notes": (
+                "• 8851BU/듀얼 인터페이스(rtwlan1) 클라이언트 대시보드 표시 오류 수정\n"
+                "• wpa_supplicant 제어 소켓 직접 연동으로 Wi-Fi 검색·연결 안정화\n"
+                "• Wi-Fi 끊김·로밍 시 순정 LTE(블루링크/OTA) 먹통 방지 및 DNS 자동 복구\n"
+                "• 순정 무선 카플레이/AA(wlan0)·LTE 충돌 방지 및 iPhone 등 서브넷 자동 대응\n"
+                "• 주변 Wi-Fi 신호 세기순 정렬·페이지 이동, 개방형(비번 없음) 및 저장 Wi-Fi 터치 연결 지원\n"
+                "• OTA 업데이트 후 변경 내역 안내 팝업 추가 (상세 정보 화면에서 언제든 다시 보기 가능)"
+            ),
         },
         indent=2,
         ensure_ascii=False,
     ) + "\n"
+    if '\\"' in version_manifest:
+        raise RuntimeError("version.json must not contain escaped quotes (breaks <=v2.0.9 OTA parser)")
 
     write_lf(PKG_SRC_DIR / "config" / "version.json", version_manifest)
 

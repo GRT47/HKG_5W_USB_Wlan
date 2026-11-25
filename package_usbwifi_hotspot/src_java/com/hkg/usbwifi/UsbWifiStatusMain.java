@@ -62,6 +62,13 @@ public class UsbWifiStatusMain {
     public static final String UI_VERSION = "2.0.10";
     public static final String GITHUB_RAW_HOST = "raw.githubusercontent.com";
     public static final String GITHUB_OTA_BASE_PATH = "/GRT47/HKG_5W_USB_Wlan/main/ota";
+    public static final String DEFAULT_RELEASE_NOTES = ""
+            + "• 8851BU/듀얼 인터페이스(rtwlan1) 클라이언트 대시보드 표시 오류 수정\n"
+            + "• wpa_supplicant 제어 소켓 직접 연동으로 Wi-Fi 검색·연결 안정화\n"
+            + "• Wi-Fi 끊김·로밍 시 순정 LTE(블루링크/OTA) 먹통 방지 및 DNS 자동 복구\n"
+            + "• 순정 무선 카플레이/AA(wlan0)·LTE 충돌 방지 및 iPhone 등 서브넷 자동 대응\n"
+            + "• 주변 Wi-Fi 신호 세기순 정렬·페이지 이동, 개방형(비번 없음) 및 저장 Wi-Fi 터치 연결 지원\n"
+            + "• OTA 업데이트 후 변경 내역 안내 팝업 추가 (상세 정보에서 다시 보기 가능)";
     private static final Charset UTF8 = Charset.forName("UTF-8");
 
     private static final String TMP_DIR_PATH = "/data/local/tmp/usbwifi_hotspot";
@@ -1026,6 +1033,18 @@ public class UsbWifiStatusMain {
         private static final List<Object> kbLetterBtns = new ArrayList<Object>();
         private static final List<String> kbLetterBaseChars = new ArrayList<String>();
 
+        // Post-Update "What's New" Modal Views & State
+        private static volatile Object updateNotesModalBox = null;
+        private static volatile Object updateModalTitleTv = null;
+        private static volatile Object updateModalSubTv = null;
+        private static volatile Object updateModalBodyTv = null;
+        private static volatile Object updateModalTimerTv = null;
+        private static volatile boolean isUpdateModalOpen = false;
+        private static volatile boolean pendingUpdatePopup = false;
+        private static volatile long updateModalAutoCloseSec = 30L;
+        private static volatile String updateModalVersion = UI_VERSION;
+        private static volatile String updateModalNotes = DEFAULT_RELEASE_NOTES;
+
         // UI State
         private static volatile boolean isVisible = false;
         private static volatile boolean isExpertView = false;
@@ -1129,6 +1148,35 @@ public class UsbWifiStatusMain {
             MapButtonLongPressMonitor.start(dir);
         }
 
+        public static boolean isUiLooperReady() {
+            return uiHandler != null;
+        }
+
+        public static void armPendingUpdatePopup(final String dir) {
+            String[] info = loadUpdateNotesContent(dir);
+            updateModalVersion = info[0];
+            updateModalNotes = info[1];
+            pendingUpdatePopup = true;
+            isUpdateModalOpen = true;
+            isEditModalOpen = false;
+            updateModalAutoCloseSec = 30L;
+        }
+
+        public static void showUpdateNotesNow(final String dir, final long autoCloseSec) {
+            String[] info = loadUpdateNotesContent(dir);
+            updateModalVersion = info[0];
+            updateModalNotes = info[1];
+            isUpdateModalOpen = true;
+            isEditModalOpen = false;
+            updateModalAutoCloseSec = autoCloseSec;
+            if (isVisible) {
+                shownAtMs = System.currentTimeMillis();
+                postToUi(REFRESH_TASK);
+            } else {
+                show();
+            }
+        }
+
         public static void showFromMapLongPress(final String detail) {
             try {
                 if (latestSnapshot == null) {
@@ -1136,6 +1184,8 @@ public class UsbWifiStatusMain {
                 }
             } catch (Throwable ignored) {
             }
+            isUpdateModalOpen = false;
+            pendingUpdatePopup = false;
             actionBannerMsg = "🗺️ 헤드유닛 [MAP] 버튼 3초 롱프레스 감지 — 대시보드가 실행되었습니다. (" + detail + ")";
             show();
         }
@@ -1969,6 +2019,20 @@ public class UsbWifiStatusMain {
             setTextViewStyle(headerSysInfoTextView, "CPU --% | RAM --", 12.5f, 0xFF94A3B8, true);
             addView.invoke(expLeftBot, headerSysInfoTextView, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
 
+            Object changelogBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(changelogBtn, "📋 업데이트 내역", 12.0f, 0xFF7DD3FC, true);
+            setPad.invoke(changelogBtn, 10, 6, 10, 6);
+            setRoundedBg(changelogBtn, 0xFF0F172A, 0xFF38BDF8, 1, 8f);
+            attachClickListener(changelogBtn, new Runnable() {
+                @Override
+                public void run() {
+                    showUpdateNotesNow(installDir, 90L);
+                }
+            });
+            Object clBtnLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(clBtnLp, 0, 0, 6, 0);
+            addView.invoke(expLeftBot, changelogBtn, clBtnLp);
+
             autoUpdateToggleBtn = tvCtor.newInstance(sysContext);
             setTextViewStyle(autoUpdateToggleBtn, "☁️ 자동업데이트: 켜짐", 12.5f, 0xFFC7D2FE, true);
             setPad.invoke(autoUpdateToggleBtn, 12, 6, 12, 6);
@@ -2036,6 +2100,12 @@ public class UsbWifiStatusMain {
 
             footerTimerTextView = tvCtor.newInstance(sysContext);
             setTextViewStyle(footerTimerTextView, "자동 닫힘: 90초 후  |  v" + UI_VERSION, 12.5f, 0xFF94A3B8, true);
+            attachClickListener(footerTimerTextView, new Runnable() {
+                @Override
+                public void run() {
+                    showUpdateNotesNow(installDir, 90L);
+                }
+            });
             addView.invoke(footerRow, footerTimerTextView, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
             addView.invoke(mainScreenBox, footerRow, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
 
@@ -2335,6 +2405,112 @@ public class UsbWifiStatusMain {
             addView.invoke(editModalBox, mBody, llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f));
             addView.invoke(root, editModalBox, llLpCtor2.newInstance(MATCH_PARENT, MATCH_PARENT));
 
+            // =====================================================================
+            // 5. POST-UPDATE "WHAT'S NEW" MODAL OVERLAY
+            // =====================================================================
+            updateNotesModalBox = llCtor.newInstance(sysContext);
+            setOrient.invoke(updateNotesModalBox, 1); // VERTICAL
+            setVis.invoke(updateNotesModalBox, 8); // GONE initially
+
+            Object uHdr = llCtor.newInstance(sysContext);
+            setOrient.invoke(uHdr, 0);
+            llSetGrav.invoke(uHdr, 16);
+
+            Object uBadge = tvCtor.newInstance(sysContext);
+            setTextViewStyle(uBadge, "🎉 업데이트 완료", 13.0f, 0xFF6EE7B7, true);
+            setPad.invoke(uBadge, 14, 6, 14, 6);
+            setRoundedBg(uBadge, 0x3310B981, 0x6634D399, 1, 18f);
+            addView.invoke(uHdr, uBadge, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+
+            updateModalTitleTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(updateModalTitleTv, "v" + UI_VERSION + " 업데이트 안내", 19.0f, 0xFFFFFFFF, true);
+            Object utLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(utLp, 12, 0, 0, 0);
+            addView.invoke(uHdr, updateModalTitleTv, utLp);
+
+            addView.invoke(uHdr, viewCls.getConstructor(ctxCls).newInstance(sysContext), llLpCtor3.newInstance(0, 1, 1.0f));
+
+            updateModalTimerTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(updateModalTimerTv, "자동 닫힘: 30초 후", 13.0f, 0xFFFCD34D, true);
+            setPad.invoke(updateModalTimerTv, 12, 6, 12, 6);
+            setRoundedBg(updateModalTimerTv, 0x33F59E0B, 0x66FBBF24, 1, 12f);
+            addView.invoke(uHdr, updateModalTimerTv, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+            addView.invoke(updateNotesModalBox, uHdr, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+
+            updateModalSubTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(updateModalSubTv, "최신 기능과 안정성 패치가 헤드유닛에 자동으로 반영되었습니다.", 13.0f, 0xFF94A3B8, false);
+            Object usLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(usLp, 0, 6, 0, 10);
+            addView.invoke(updateNotesModalBox, updateModalSubTv, usLp);
+
+            Object uCard = llCtor.newInstance(sysContext);
+            setOrient.invoke(uCard, 1);
+            setPad.invoke(uCard, 20, 14, 20, 14);
+            setRoundedBg(uCard, 0xFF0F172A, 0xFF38BDF8, 1, 14f);
+
+            updateModalBodyTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(updateModalBodyTv, DEFAULT_RELEASE_NOTES, 15.0f, 0xFFF1F5F9, false);
+            try {
+                tvCls.getMethod("setLineSpacing", float.class, float.class).invoke(updateModalBodyTv, 6.0f, 1.15f);
+            } catch (Throwable ignored) {
+            }
+
+            try {
+                Class<?> svCls = Class.forName("android.widget.ScrollView");
+                Class<?> flLpCls = Class.forName("android.widget.FrameLayout$LayoutParams");
+                Object sv = svCls.getConstructor(ctxCls).newInstance(sysContext);
+                svCls.getMethod("setFillViewport", boolean.class).invoke(sv, true);
+                Object flLp = flLpCls.getConstructor(int.class, int.class).newInstance(MATCH_PARENT, WRAP_CONTENT);
+                vgCls.getMethod("addView", viewCls, vgLpCls).invoke(sv, updateModalBodyTv, flLp);
+                addView.invoke(uCard, sv, llLpCtor2.newInstance(MATCH_PARENT, MATCH_PARENT));
+            } catch (Throwable ignored) {
+                addView.invoke(uCard, updateModalBodyTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+            }
+            addView.invoke(updateNotesModalBox, uCard, llLpCtor3.newInstance(MATCH_PARENT, 0, 1.0f));
+
+            Object uBot = llCtor.newInstance(sysContext);
+            setOrient.invoke(uBot, 0);
+            llSetGrav.invoke(uBot, 16);
+            Object uHintTv = tvCtor.newInstance(sysContext);
+            setTextViewStyle(uHintTv, "💡 상세 정보 화면의 [📋 업데이트 내역] 또는 버전 표시를 터치하면 언제든 다시 볼 수 있습니다.", 12.5f, 0xFF94A3B8, false);
+            addView.invoke(uBot, uHintTv, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+
+            Object uOpenDashBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(uOpenDashBtn, "📊 대시보드 열기", 14.5f, 0xFFFFFFFF, true);
+            tvSetGravity.invoke(uOpenDashBtn, 17);
+            setPad.invoke(uOpenDashBtn, 22, 11, 22, 11);
+            setRoundedBg(uOpenDashBtn, 0xFF0284C7, 0xFF38BDF8, 1, 10f);
+            attachClickListener(uOpenDashBtn, new Runnable() {
+                @Override
+                public void run() {
+                    isUpdateModalOpen = false;
+                    shownAtMs = System.currentTimeMillis();
+                    postToUi(REFRESH_TASK);
+                }
+            });
+            Object uodLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
+            setMargins(uodLp, 12, 0, 10, 0);
+            addView.invoke(uBot, uOpenDashBtn, uodLp);
+
+            Object uCloseBtn = tvCtor.newInstance(sysContext);
+            setTextViewStyle(uCloseBtn, "✔ 확인 (닫기)", 14.5f, 0xFFFFFFFF, true);
+            tvSetGravity.invoke(uCloseBtn, 17);
+            setPad.invoke(uCloseBtn, 26, 11, 26, 11);
+            setRoundedBg(uCloseBtn, 0xFF059669, 0xFF34D399, 1, 10f);
+            attachClickListener(uCloseBtn, new Runnable() {
+                @Override
+                public void run() {
+                    hideOnUiThread();
+                }
+            });
+            addView.invoke(uBot, uCloseBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+
+            Object ubLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(ubLp, 0, 12, 0, 0);
+            addView.invoke(updateNotesModalBox, uBot, ubLp);
+
+            addView.invoke(root, updateNotesModalBox, llLpCtor2.newInstance(MATCH_PARENT, MATCH_PARENT));
+
             return root;
         }
 
@@ -2397,6 +2573,16 @@ public class UsbWifiStatusMain {
                         rootOverlayView = candidateRoot;
                         isVisible = true;
                         isEditModalOpen = false;
+                        if (pendingUpdatePopup) {
+                            pendingUpdatePopup = false;
+                            isUpdateModalOpen = true;
+                            new Thread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    markUpdateNotesSeen(installDir, TMP_DIR_PATH, UI_VERSION);
+                                }
+                            }, "MarkUpdateSeenThread").start();
+                        }
                         shownAtMs = System.currentTimeMillis();
                         System.out.println("[USBWifiUI] StatusDashboardOverlay full-screen displayed (windowType=" + wtype + ")");
                         refreshOnUiThread();
@@ -2420,6 +2606,7 @@ public class UsbWifiStatusMain {
             rootOverlayView = null;
             isVisible = false;
             isEditModalOpen = false;
+            isUpdateModalOpen = false;
             try {
                 removeCallbacksFromUi(REFRESH_TASK);
                 if (oldRoot != null && windowManager != null) {
@@ -2446,7 +2633,8 @@ public class UsbWifiStatusMain {
                 shownAtMs = now;
             }
             long elapsedSec = (now - shownAtMs) / 1000L;
-            if (elapsedSec >= 90L) {
+            long closeLimitSec = isUpdateModalOpen ? updateModalAutoCloseSec : 90L;
+            if (!isEditModalOpen && elapsedSec >= closeLimitSec) {
                 hideOnUiThread();
                 return;
             }
@@ -2460,11 +2648,22 @@ public class UsbWifiStatusMain {
 
                 if (isEditModalOpen) {
                     setVis.invoke(mainScreenBox, 8);
+                    if (updateNotesModalBox != null) setVis.invoke(updateNotesModalBox, 8);
                     setVis.invoke(editModalBox, 0);
                     refreshModalInputsOnUi();
                     return;
+                } else if (isUpdateModalOpen && updateNotesModalBox != null) {
+                    setVis.invoke(mainScreenBox, 8);
+                    setVis.invoke(editModalBox, 8);
+                    setVis.invoke(updateNotesModalBox, 0);
+                    setText.invoke(updateModalTitleTv, "v" + updateModalVersion + " 업데이트 안내");
+                    setText.invoke(updateModalBodyTv, updateModalNotes);
+                    long rem = Math.max(1L, updateModalAutoCloseSec - elapsedSec);
+                    setText.invoke(updateModalTimerTv, "자동 닫힘: " + rem + "초 후");
+                    return;
                 } else {
                     setVis.invoke(editModalBox, 8);
+                    if (updateNotesModalBox != null) setVis.invoke(updateNotesModalBox, 8);
                     setVis.invoke(mainScreenBox, 0);
                 }
 
@@ -3293,6 +3492,7 @@ public class UsbWifiStatusMain {
                     localLaunch.setExecutable(true, false);
                 }
                 writeBytesAtomic(new File(dir, "config/version.json"), verBytes);
+                writeBytesAtomic(new File(TMP_DIR_PATH, "ota_just_updated"), (remoteVer + "\n").getBytes(UTF8));
                 execCommandCapture(new String[]{"/system/bin/sh", "-c",
                         "chmod 755 \"" + localDaemon.getAbsolutePath() + "\" \"" + localLaunch.getAbsolutePath() + "\" 2>/dev/null; "
                                 + "chmod 644 \"" + localJar.getAbsolutePath() + "\" 2>/dev/null; "
@@ -3308,11 +3508,9 @@ public class UsbWifiStatusMain {
                     writeBytesAtomic(new File(TMP_DIR_PATH, "ota_reload_daemon"), "1\n".getBytes(UTF8));
                 }
                 if (jarChanged || forceApply) {
-                    final boolean wasVisible = isVisible;
                     Thread.sleep(1500L);
-                    if (wasVisible) {
-                        writeBytesAtomic(new File(TMP_DIR_PATH, "show_ui"), "1\n".getBytes(UTF8));
-                    }
+                    // Always open the updated UI so post-update "What's New" notes are shown cleanly
+                    writeBytesAtomic(new File(TMP_DIR_PATH, "show_ui"), "1\n".getBytes(UTF8));
                     String relaunchCmd = "sleep 1; rm -f /data/local/tmp/usbwifi_hotspot/ui_java.lock /data/local/tmp/usbwifi_hotspot/ui_java.pid 2>/dev/null; "
                             + "/system/bin/sh \"" + localLaunch.getAbsolutePath() + "\" >/dev/null 2>&1 &";
                     new ProcessBuilder("/system/bin/sh", "-c", relaunchCmd).start();
@@ -3322,6 +3520,9 @@ public class UsbWifiStatusMain {
                     } catch (Throwable ignored) {
                     }
                     System.exit(0);
+                } else {
+                    markUpdateNotesSeen(dir, TMP_DIR_PATH, remoteVer);
+                    showUpdateNotesNow(dir, 30L);
                 }
             } catch (Throwable t) {
                 otaStatusSummary = "연결 확인 필요";
@@ -4064,6 +4265,18 @@ public class UsbWifiStatusMain {
         } catch (Throwable ignored) {
         }
         StatusDashboardOverlay.init(installDir);
+        for (int w = 0; w < 30 && !StatusDashboardOverlay.isUiLooperReady(); w++) {
+            Thread.sleep(100L);
+        }
+        try {
+            if (shouldShowUpdateNotesPopup(installDir, TMP_DIR_PATH, UI_VERSION)) {
+                StatusDashboardOverlay.armPendingUpdatePopup(installDir);
+                writeBytesAtomic(showUiFile, "1\n".getBytes(UTF8));
+            } else if (!new File(installDir, "config/seen_update_version.txt").isFile()) {
+                markUpdateNotesSeen(installDir, TMP_DIR_PATH, UI_VERSION);
+            }
+        } catch (Throwable ignored) {
+        }
 
         File modeswitchFile = new File(tmpDir, "trigger_modeswitch");
         File modeswitchDoneFile = new File(tmpDir, "modeswitch_done");
@@ -4687,6 +4900,129 @@ public class UsbWifiStatusMain {
         return bos.toByteArray();
     }
 
+    private static boolean fileContainsText(File f, String needle) {
+        if (f == null || !f.isFile() || needle == null || needle.isEmpty()) return false;
+        BufferedReader br = null;
+        try {
+            br = new BufferedReader(new InputStreamReader(new FileInputStream(f), UTF8));
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.contains(needle)) return true;
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (br != null) try { br.close(); } catch (Exception ignored) {}
+        }
+        return false;
+    }
+
+    /** Returns true if this startup is an upgrade that has not yet shown release notes for currentVersion. */
+    public static boolean shouldShowUpdateNotesPopup(String installDir, String tmpDirPath, String currentVersion) {
+        if (installDir == null || currentVersion == null || currentVersion.isEmpty()) return false;
+        if (tmpDirPath != null && new File(tmpDirPath, "ota_just_updated").isFile()) {
+            return true;
+        }
+        String seenVer = readFirstLineQuick(new File(installDir, "config/seen_update_version.txt")).trim();
+        if (currentVersion.equals(seenVer)) {
+            return false;
+        }
+        if (!seenVer.isEmpty()) {
+            return true;
+        }
+        // Upgrading from <= v2.0.9 (which never wrote seen_update_version.txt): check backup/log evidence
+        if (new File(installDir, "bin/usbwifistatus.jar.bak").isFile()
+                || new File(installDir, "svc/usbwifi-hotspot-daemon.sh.bak").isFile()) {
+            return true;
+        }
+        return tmpDirPath != null && fileContainsText(
+                new File(tmpDirPath, "daemon.log"),
+                "[OTA] Updated to v" + currentVersion);
+    }
+
+    public static void markUpdateNotesSeen(String installDir, String tmpDirPath, String version) {
+        try {
+            if (installDir != null && version != null && !version.isEmpty()) {
+                File seenFile = new File(installDir, "config/seen_update_version.txt");
+                if (seenFile.getParentFile() != null && !seenFile.getParentFile().exists()) {
+                    seenFile.getParentFile().mkdirs();
+                }
+                writeBytesAtomic(seenFile, (version + "\n").getBytes(UTF8));
+            }
+            if (tmpDirPath != null) {
+                File flag = new File(tmpDirPath, "ota_just_updated");
+                if (flag.exists()) flag.delete();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static String[] loadUpdateNotesContent(String installDir) {
+        String ver = UI_VERSION;
+        String notes = DEFAULT_RELEASE_NOTES;
+        try {
+            if (installDir != null) {
+                File verFile = new File(installDir, "config/version.json");
+                if (verFile.isFile()) {
+                    String raw = new String(readAllBytes(new FileInputStream(verFile)), UTF8);
+                    Map<String, String> vmap = parseJsonFlatMap(raw);
+                    String v = getOrDefault(vmap, "version", "");
+                    if (!v.isEmpty()) ver = v;
+                    String rn = getOrDefault(vmap, "release_notes", "");
+                    if (!rn.isEmpty()) {
+                        notes = rn;
+                    } else {
+                        String desc = getOrDefault(vmap, "description", "");
+                        if (!desc.isEmpty()) notes = desc;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return new String[]{ver, notes};
+    }
+
+    private static int readJsonStringToken(String json, int openQuoteIdx, StringBuilder out) {
+        int i = openQuoteIdx + 1;
+        int n = json.length();
+        while (i < n) {
+            char c = json.charAt(i++);
+            if (c == '"') {
+                return i;
+            }
+            if (c == '\\' && i < n) {
+                char esc = json.charAt(i++);
+                switch (esc) {
+                    case '"': out.append('"'); break;
+                    case '\\': out.append('\\'); break;
+                    case '/': out.append('/'); break;
+                    case 'n': out.append('\n'); break;
+                    case 'r': out.append('\r'); break;
+                    case 't': out.append('\t'); break;
+                    case 'b': out.append('\b'); break;
+                    case 'f': out.append('\f'); break;
+                    case 'u':
+                        if (i + 4 <= n) {
+                            try {
+                                out.append((char) Integer.parseInt(json.substring(i, i + 4), 16));
+                                i += 4;
+                            } catch (Throwable ignored) {
+                                out.append("\\u");
+                            }
+                        } else {
+                            out.append("\\u");
+                        }
+                        break;
+                    default:
+                        out.append(esc);
+                        break;
+                }
+            } else {
+                out.append(c);
+            }
+        }
+        return n;
+    }
+
     public static Map<String, String> parseJsonFlatMap(String json) {
         Map<String, String> map = new LinkedHashMap<String, String>();
         if (json == null) return map;
@@ -4695,18 +5031,16 @@ public class UsbWifiStatusMain {
         while (i < n) {
             int q1 = json.indexOf('"', i);
             if (q1 < 0) break;
-            int q2 = json.indexOf('"', q1 + 1);
-            if (q2 < 0) break;
-            String key = json.substring(q1 + 1, q2);
-            int colon = json.indexOf(':', q2 + 1);
+            StringBuilder keySb = new StringBuilder();
+            int afterKey = readJsonStringToken(json, q1, keySb);
+            int colon = json.indexOf(':', afterKey);
             if (colon < 0) break;
             int v1 = json.indexOf('"', colon + 1);
             if (v1 < 0) break;
-            int v2 = json.indexOf('"', v1 + 1);
-            if (v2 < 0) break;
-            String val = json.substring(v1 + 1, v2);
-            map.put(key, val);
-            i = v2 + 1;
+            StringBuilder valSb = new StringBuilder();
+            int afterVal = readJsonStringToken(json, v1, valSb);
+            map.put(keySb.toString(), valSb.toString());
+            i = afterVal;
         }
         return map;
     }
@@ -5573,7 +5907,70 @@ public class UsbWifiStatusMain {
             tmpKv.delete();
         }
 
-        System.out.println("USBWIFI STATUS UI SELF-TEST PASSED! (" + compact + ", mapHoldTests=OK, rtl8831buTests=OK, modeswitchTests=OK, staTests=OK)");
+        // 8) Post-update JSON escape parsing & update popup state tests
+        Map<String, String> escJson = parseJsonFlatMap("{\"version\": \"2.0.10\", \"release_notes\": \"• 첫째 줄\\n• '인용' & \\\\백슬래시\\t끝\"}");
+        if (!"2.0.10".equals(escJson.get("version"))
+                || !"• 첫째 줄\n• '인용' & \\백슬래시\t끝".equals(escJson.get("release_notes"))) {
+            throw new AssertionError("parseJsonFlatMap escaped string test failed: " + escJson.get("release_notes"));
+        }
+
+        File mockRoot = File.createTempFile("usbwifi_upd_", "_dir");
+        mockRoot.delete();
+        mockRoot.mkdirs();
+        File mockInst = new File(mockRoot, "app");
+        File mockTmp = new File(mockRoot, "tmp");
+        new File(mockInst, "config").mkdirs();
+        new File(mockInst, "bin").mkdirs();
+        mockTmp.mkdirs();
+        try {
+            // Case 1: Fresh install -> false
+            if (shouldShowUpdateNotesPopup(mockInst.getAbsolutePath(), mockTmp.getAbsolutePath(), "2.0.10")) {
+                throw new AssertionError("Fresh install must not show update popup");
+            }
+            // Case 2: Upgrade from <= v2.0.9 (.jar.bak exists) -> true, then mark seen -> false
+            writeBytesAtomic(new File(mockInst, "bin/usbwifistatus.jar.bak"), "old".getBytes(UTF8));
+            if (!shouldShowUpdateNotesPopup(mockInst.getAbsolutePath(), mockTmp.getAbsolutePath(), "2.0.10")) {
+                throw new AssertionError("Upgrade with .jar.bak must show update popup");
+            }
+            markUpdateNotesSeen(mockInst.getAbsolutePath(), mockTmp.getAbsolutePath(), "2.0.10");
+            if (shouldShowUpdateNotesPopup(mockInst.getAbsolutePath(), mockTmp.getAbsolutePath(), "2.0.10")) {
+                throw new AssertionError("Popup must not repeat once marked seen");
+            }
+            // Case 3: Upgrade from 2.0.9 seen -> 2.0.10 current -> true
+            writeBytesAtomic(new File(mockInst, "config/seen_update_version.txt"), "2.0.9\n".getBytes(UTF8));
+            if (!shouldShowUpdateNotesPopup(mockInst.getAbsolutePath(), mockTmp.getAbsolutePath(), "2.0.10")) {
+                throw new AssertionError("Version bump from 2.0.9 to 2.0.10 must show update popup");
+            }
+            markUpdateNotesSeen(mockInst.getAbsolutePath(), mockTmp.getAbsolutePath(), "2.0.10");
+            // Case 4: Force-reinstall (ota_just_updated exists even when seen == current) -> true, then false
+            writeBytesAtomic(new File(mockTmp, "ota_just_updated"), "2.0.10\n".getBytes(UTF8));
+            if (!shouldShowUpdateNotesPopup(mockInst.getAbsolutePath(), mockTmp.getAbsolutePath(), "2.0.10")) {
+                throw new AssertionError("Force-reinstall flag ota_just_updated must show popup");
+            }
+            markUpdateNotesSeen(mockInst.getAbsolutePath(), mockTmp.getAbsolutePath(), "2.0.10");
+            if (shouldShowUpdateNotesPopup(mockInst.getAbsolutePath(), mockTmp.getAbsolutePath(), "2.0.10")) {
+                throw new AssertionError("markUpdateNotesSeen must clear ota_just_updated");
+            }
+            // Case 5: loadUpdateNotesContent reads release_notes from config/version.json
+            writeBytesAtomic(new File(mockInst, "config/version.json"),
+                    "{\"version\":\"2.0.10\",\"release_notes\":\"항목1\\n항목2\"}".getBytes(UTF8));
+            String[] loadedNotes = loadUpdateNotesContent(mockInst.getAbsolutePath());
+            if (!"2.0.10".equals(loadedNotes[0]) || !"항목1\n항목2".equals(loadedNotes[1])) {
+                throw new AssertionError("loadUpdateNotesContent failed");
+            }
+        } finally {
+            new File(mockInst, "config/seen_update_version.txt").delete();
+            new File(mockInst, "config/version.json").delete();
+            new File(mockInst, "bin/usbwifistatus.jar.bak").delete();
+            new File(mockTmp, "ota_just_updated").delete();
+            new File(mockInst, "config").delete();
+            new File(mockInst, "bin").delete();
+            mockInst.delete();
+            mockTmp.delete();
+            mockRoot.delete();
+        }
+
+        System.out.println("USBWIFI STATUS UI SELF-TEST PASSED! (" + compact + ", mapHoldTests=OK, rtl8831buTests=OK, modeswitchTests=OK, staTests=OK, updatePopupTests=OK)");
         return 0;
     }
 
